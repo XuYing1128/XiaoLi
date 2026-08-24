@@ -62,7 +62,9 @@ const WINDOW_EDGE_MARGIN_DIP: f64 = 12.0;
 const WINDOW_ANCHOR_SNAP_DIP: f64 = 24.0;
 const WINDOW_EVENT_DEBOUNCE_MS: u64 = 400;
 const WINDOW_INTERACTION_POLL_MS: u64 = 50;
+#[cfg(any(windows, test))]
 const PHYSICAL_LEFT_BUTTON_VK: i32 = 0x01;
+#[cfg(any(windows, test))]
 const PHYSICAL_RIGHT_BUTTON_VK: i32 = 0x02;
 const TRAY_ICON_SIZE: u32 = 32;
 const TRAY_BASE_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-base-32.rgba"));
@@ -2262,6 +2264,7 @@ fn native_primary_button_down() -> bool {
     false
 }
 
+#[cfg(any(windows, test))]
 fn primary_button_virtual_key(swapped: bool) -> i32 {
     if swapped {
         PHYSICAL_RIGHT_BUTTON_VK

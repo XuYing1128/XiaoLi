@@ -82,6 +82,7 @@ fn acquire_instance_guard_at(lock_path: &Path) -> Result<Option<InstanceGuard>, 
 
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(lock_path)
@@ -96,8 +97,7 @@ fn acquire_instance_guard_at(lock_path: &Path) -> Result<Option<InstanceGuard>, 
 #[cfg(not(windows))]
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
-        use fs2::FileExt;
-        let _ = self.0.unlock();
+        let _ = fs2::FileExt::unlock(&self.0);
     }
 }
 
