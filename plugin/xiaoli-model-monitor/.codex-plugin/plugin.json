@@ -1,0 +1,41 @@
+{
+  "name": "xiaoli-model-monitor",
+  "version": "0.1.0-beta.1",
+  "description": "小狸提供只读的 Codex 请求模型、effort、路由证据、token、缓存、时序与质量评估。",
+  "author": {
+    "name": "XuYing1128",
+    "url": "https://github.com/XuYing1128"
+  },
+  "homepage": "https://github.com/XuYing1128/XiaoLi",
+  "repository": "https://github.com/XuYing1128/XiaoLi",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "keywords": [
+    "codex",
+    "model",
+    "telemetry",
+    "tokens",
+    "xiaoli"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "小狸 · XiaoLi",
+    "shortDescription": "查看 Codex 请求模型、路由证据与 token 指标。",
+    "longDescription": "本地只读监视器，严格区分请求模型/effort、显式服务器重路由和行为统计异常。",
+    "developerName": "XuYing1128",
+    "category": "Productivity",
+    "capabilities": [
+      "Read"
+    ],
+    "websiteURL": "https://github.com/XuYing1128/XiaoLi",
+    "defaultPrompt": [
+      "显示当前小狸监视摘要。",
+      "显示当前任务的模型证据和 token。",
+      "渲染一张小狸监视卡。"
+    ],
+    "brandColor": "#8B7AA8",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/logo.svg",
+    "logoDark": "./assets/logo-dark.svg"
+  }
+}

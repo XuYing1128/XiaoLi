@@ -1,0 +1,387 @@
+name: Portable release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to package
+        required: true
+        default: v0.1.0-beta.1
+
+permissions:
+  contents: read
+
+concurrency:
+  # A manual dispatch normally runs from `main`, while a tag push runs from the
+  # tag. Key both forms by the release tag so they cannot mutate one draft in
+  # parallel.
+  group: portable-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  XIAOLI_VERSION: 0.1.0-beta.1
+
+jobs:
+  validate-ref:
+    name: Validate release ref
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.ref.outputs.tag }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - name: Resolve and validate tag
+        id: ref
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            tag="${INPUT_TAG}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          [[ "${tag}" == "v${XIAOLI_VERSION}" ]] || {
+            echo "Expected v${XIAOLI_VERSION}; received ${tag}" >&2
+            exit 1
+          }
+          node scripts/release/verify-version.mjs "${XIAOLI_VERSION}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+  windows-portable:
+    name: Windows x64 portable
+    needs: validate-ref
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate-ref.outputs.tag }}
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10
+          run_install: false
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build without an installer
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        with:
+          args: --no-bundle
+      - name: Smoke-test executable
+        shell: pwsh
+        run: >-
+          ./scripts/release/Test-Portable.ps1
+          -Executable src-tauri/target/release/xiaoli.exe
+          -ScratchRoot "${{ runner.temp }}/xiaoli-smoke"
+      - name: Package Windows ZIP
+        shell: pwsh
+        run: >-
+          ./scripts/release/Package-Windows.ps1
+          -Executable src-tauri/target/release/xiaoli.exe
+          -OutputDirectory release-out
+          -Version $env:XIAOLI_VERSION
+      - name: Extract and smoke-test final Windows ZIP
+        shell: pwsh
+        run: >-
+          ./scripts/release/Test-WindowsArchive.ps1
+          -Archive "release-out/XiaoLi-v$env:XIAOLI_VERSION-Windows-x64-portable.zip"
+          -ScratchRoot "${{ runner.temp }}/xiaoli-windows-archive-smoke"
+      - name: Upload Windows portable artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-portable
+          path: release-out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-portable:
+    name: macOS Universal portable
+    needs: validate-ref
+    runs-on: macos-14
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate-ref.outputs.tag }}
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10
+          run_install: false
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install Rust Universal targets
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build Universal app bundle only
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        with:
+          args: --target universal-apple-darwin --bundles app
+      - name: Verify Universal executable and ad-hoc signature
+        shell: bash
+        run: |
+          app="src-tauri/target/universal-apple-darwin/release/bundle/macos/XiaoLi.app"
+          test -d "${app}"
+          binary="${app}/Contents/MacOS/xiaoli"
+          archs="$(lipo -archs "${binary}")"
+          [[ "${archs}" == *arm64* && "${archs}" == *x86_64* ]]
+          codesign --verify --deep --strict "${app}"
+      - name: Package macOS app ZIP
+        shell: bash
+        run: >-
+          bash ./scripts/release/package-macos.sh
+          src-tauri/target/universal-apple-darwin/release/bundle/macos/XiaoLi.app
+          release-out
+          "${XIAOLI_VERSION}"
+      - name: Extract and smoke-test final macOS ZIP
+        shell: bash
+        run: >-
+          bash ./scripts/release/test-macos-archive.sh
+          "release-out/XiaoLi-v${XIAOLI_VERSION}-macOS-universal.app.zip"
+          "${RUNNER_TEMP}/xiaoli-macos-archive-smoke"
+      - name: Upload macOS portable artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-portable
+          path: release-out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-portable:
+    name: Linux x64 portable
+    needs: validate-ref
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate-ref.outputs.tag }}
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl file libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev patchelf wget zip
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10
+          run_install: false
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build AppImage only
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        with:
+          args: --bundles appimage
+      - name: Smoke-test native executable
+        shell: pwsh
+        run: >-
+          ./scripts/release/Test-Portable.ps1
+          -Executable src-tauri/target/release/xiaoli
+          -ScratchRoot "${{ runner.temp }}/xiaoli-smoke"
+      - name: Package AppImage archives
+        shell: bash
+        run: >-
+          bash ./scripts/release/package-linux.sh
+          src-tauri/target/release/bundle/appimage
+          release-out
+          "${XIAOLI_VERSION}"
+      - name: Extract and smoke-test final Linux archives
+        shell: bash
+        run: >-
+          bash ./scripts/release/test-linux-archives.sh
+          "release-out/XiaoLi-v${XIAOLI_VERSION}-Linux-x64-portable.tar.gz"
+          "release-out/XiaoLi-v${XIAOLI_VERSION}-Linux-x64-portable.zip"
+          "${RUNNER_TEMP}/xiaoli-linux-archive-smoke"
+      - name: Upload Linux portable artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-portable
+          path: release-out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release-metadata:
+    name: Plugin, notices and SBOM
+    needs: validate-ref
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate-ref.outputs.tag }}
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10
+          run_install: false
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Validate and package plugin
+        shell: pwsh
+        run: |
+          node scripts/release/validate-plugin.mjs plugin/xiaoli-model-monitor
+          ./scripts/release/Package-Plugin.ps1 -OutputDirectory release-out -Version $env:XIAOLI_VERSION
+      - name: Extract and validate final plugin ZIP
+        shell: pwsh
+        run: >-
+          ./scripts/release/Test-PluginArchive.ps1
+          -Archive "release-out/xiaoli-codex-plugin-v$env:XIAOLI_VERSION.zip"
+          -ScratchRoot "${{ runner.temp }}/xiaoli-plugin-archive-smoke"
+      - name: Generate third-party notice catalog
+        run: node scripts/release/generate-third-party-licenses.mjs release-out/THIRD_PARTY_LICENSES.html
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c
+        with:
+          path: .
+          format: spdx-json
+          output-file: release-out/XiaoLi-v0.1.0-beta.1.spdx.json
+          upload-artifact: false
+          # Publishing is deliberately centralized in the final job. Anchore's
+          # default would otherwise attach to a draft left by a failed run and
+          # needs contents:write in this read-only metadata job.
+          upload-release-assets: false
+      - name: Upload release metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-metadata
+          path: release-out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    name: Assemble complete release
+    needs:
+      - validate-ref
+      - windows-portable
+      - macos-portable
+      - linux-portable
+      - release-metadata
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate-ref.outputs.tag }}
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Download every release component
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: "*-portable"
+          path: release-out
+          merge-multiple: true
+      - name: Download metadata component
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-metadata
+          path: release-out
+      - name: Generate checksums and validate completeness
+        run: |
+          node scripts/release/generate-checksums.mjs release-out release-out/SHA256SUMS.txt
+          node scripts/release/validate-release.mjs release-out "${XIAOLI_VERSION}"
+      - name: Upload assembled release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: complete-portable-release
+          path: release-out/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish prerelease atomically
+    needs:
+      - validate-ref
+      - assemble
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate-ref.outputs.tag }}
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Download complete release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: complete-portable-release
+          path: release-out
+      - name: Revalidate before publishing
+        run: node scripts/release/validate-release.mjs release-out "${XIAOLI_VERSION}"
+      - name: Create draft, upload all assets, then publish prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate-ref.outputs.tag }}
+        run: |
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            is_draft="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft)"
+            [[ "${is_draft}" == "true" ]] || {
+              echo "Refusing to replace an already-published release" >&2
+              exit 1
+            }
+            while IFS= read -r asset; do
+              [[ -z "${asset}" ]] || gh release delete-asset "${RELEASE_TAG}" "${asset}" --yes
+            done < <(gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name')
+          else
+            gh release create "${RELEASE_TAG}" \
+              --draft --prerelease \
+              --title "小狸 XiaoLi ${RELEASE_TAG}" \
+              --notes-file CHANGELOG.md
+          fi
+          gh release upload "${RELEASE_TAG}" release-out/* --clobber
+          expected="$(find release-out -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          actual="$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets | length')"
+          [[ "${actual}" == "${expected}" ]] || {
+            echo "Draft asset count mismatch: expected ${expected}, got ${actual}" >&2
+            exit 1
+          }
+          gh release edit "${RELEASE_TAG}" --draft=false --prerelease

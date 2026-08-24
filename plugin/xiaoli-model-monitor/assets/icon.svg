@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="XiaoLi icon">
+  <rect width="64" height="64" rx="18" fill="#FFF3F7"/>
+  <path d="M16 34c5-9 10-13 16-13s11 4 16 13c-5 9-10 13-16 13S21 43 16 34Z" fill="#F29CB2"/>
+  <circle cx="32" cy="34" r="8" fill="#FFFFFF"/>
+  <circle cx="32" cy="34" r="4" fill="#4AAE83"/>
+  <path d="M46 14c0 4-3 7-7 7 4 0 7 3 7 7 0-4 3-7 7-7-4 0-7-3-7-7Z" fill="#F6C35B"/>
+</svg>

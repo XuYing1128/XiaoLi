@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "xiaoli-model-monitor": {
+      "type": "stdio",
+      "command": "{{XIAOLI_EXECUTABLE}}",
+      "args": [
+        "--mcp-server"
+      ],
+      "startup_timeout_sec": 5,
+      "tool_timeout_sec": 3
+    }
+  }
+}

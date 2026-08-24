@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "XiaoLi",
+  "version": "0.1.0-beta.1",
+  "identifier": "io.github.xuying1128.xiaoli",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "小狸 · XiaoLi",
+        "width": 304,
+        "height": 72,
+        "minWidth": 280,
+        "minHeight": 68,
+        "maxWidth": 520,
+        "maxHeight": 120,
+        "resizable": true,
+        "maximizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false,
+        "theme": "Light"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [],
+    "publisher": "XuYing1128",
+    "shortDescription": "Evidence-aware Codex model, token, cache and timing monitor",
+    "longDescription": "XiaoLi is a compact source-available companion that distinguishes Codex request settings, explicit server reroute evidence and conservative local behavior signals.",
+    "licenseFile": "../LICENSE",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "signingIdentity": "-"
+    }
+  }
+}

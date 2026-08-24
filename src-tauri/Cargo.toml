@@ -1,0 +1,62 @@
+[package]
+name = "xiaoli"
+version = "0.1.0-beta.1"
+description = "XiaoLi: evidence-aware Codex model and token monitor"
+authors = ["XuYing1128"]
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/XuYing1128/XiaoLi"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "codex_model_monitor_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dependencies]
+# Keep the desktop runtime features while omitting `common-controls-v6`.
+# The monitor does not use native task dialogs; omitting that feature also
+# keeps Windows test executables from importing TaskDialogIndirect without an
+# application activation manifest.
+tauri = { version = "2", default-features = false, features = [
+  "wry",
+  "compression",
+  "dynamic-acl",
+  "x11",
+  "dbus",
+  "tray-icon",
+  "image-png",
+] }
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+interprocess = "2"
+notify = "8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sysinfo = "0.37"
+atomicwrites = "0.4"
+widestring = "1"
+fs2 = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
