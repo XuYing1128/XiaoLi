@@ -1,6 +1,6 @@
 [package]
 name = "xiaoli"
-version = "0.1.0-beta.2"
+version = "0.1.0-beta.3"
 description = "XiaoLi: evidence-aware Codex model and token monitor"
 authors = ["XuYing1128"]
 edition = "2021"

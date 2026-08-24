@@ -6,7 +6,7 @@
 
 <p align="center">一个小巧、可拖动、可缩放的 Codex 模型、Token、缓存与时序旁路监视器。</p>
 
-> 当前版本：`v0.1.0-beta.2`。这是独立社区项目，与 OpenAI 没有隶属关系，也不代表 OpenAI 官方背书。
+> 当前版本：`v0.1.0-beta.3`。这是独立社区项目，与 OpenAI 没有隶属关系，也不代表 OpenAI 官方背书。
 
 [English](README.en.md) · [下载便携版](https://github.com/XuYing1128/XiaoLi/releases) · [状态与证据详解](docs/STATUS_AND_EVIDENCE.md) · [故障排查](docs/TROUBLESHOOTING.md)
 
@@ -55,7 +55,7 @@ Codex 界面显示的是你选择的模型和思考档位，但开发者还会�
 
 ### Windows 10/11 x64
 
-1. 从 [Releases](https://github.com/XuYing1128/XiaoLi/releases) 下载 `XiaoLi-v0.1.0-beta.2-Windows-x64-portable.zip`。
+1. 从 [Releases](https://github.com/XuYing1128/XiaoLi/releases) 下载 `XiaoLi-v0.1.0-beta.3-Windows-x64-portable.zip`。
 2. 解压到一个长期保留的目录，例如 `D:\Apps\XiaoLi`。
 3. 双击 `XiaoLi.exe`。首次启动会为当前用户写入或修复 Codex 插件路径，不需要管理员权限和 Node.js。
 4. 在 Codex 中打开 `/hooks`，审阅并信任 `xiaoli-model-monitor` 的本地 hook。插件配置不会绕过 Codex 的 hook 信任确认。
@@ -65,7 +65,7 @@ Codex 界面显示的是你选择的模型和思考档位，但开发者还会�
 
 ### macOS 12+，Intel 与 Apple Silicon
 
-1. 下载并解压 `XiaoLi-v0.1.0-beta.2-macOS-universal.app.zip`。
+1. 下载并解压 `XiaoLi-v0.1.0-beta.3-macOS-universal.app.zip`。
 2. 将 `XiaoLi.app` 移到“应用程序”，然后打开。
 3. 首个 beta 采用 ad-hoc 签名、未公证。如果 Gatekeeper 阻止启动，请在“系统设置 → 隐私与安全性”中核对应用后选择“仍要打开”。项目不会提供关闭 Gatekeeper 的脚本。
 
