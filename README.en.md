@@ -6,7 +6,7 @@
 
 XiaoLi is a compact, draggable, resizable companion that monitors Codex request model, requested reasoning effort, tokens, cached input, timing, and explicit server-reroute evidence.
 
-> Current release: `v0.1.0-beta.1`. XiaoLi is an independent community project. It is not affiliated with or endorsed by OpenAI.
+> Current release: `v0.1.0-beta.2`. XiaoLi is an independent community project. It is not affiliated with or endorsed by OpenAI.
 
 [中文](README.md) · [Portable downloads](https://github.com/XuYing1128/XiaoLi/releases) · [Evidence reference](docs/STATUS_AND_EVIDENCE.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
 
@@ -46,7 +46,7 @@ The same guide is built into the app under `… → Status and evidence`.
 
 ### Windows x64
 
-1. Download `XiaoLi-v0.1.0-beta.1-Windows-x64-portable.zip` from [Releases](https://github.com/XuYing1128/XiaoLi/releases).
+1. Download `XiaoLi-v0.1.0-beta.2-Windows-x64-portable.zip` from [Releases](https://github.com/XuYing1128/XiaoLi/releases).
 2. Extract it to a permanent folder.
 3. Run `XiaoLi.exe`. The GUI writes or repairs the current-user Codex plugin configuration without Node.js or administrator access.
 4. Open `/hooks` in Codex, review the local `xiaoli-model-monitor` hook, and explicitly trust it. XiaoLi never bypasses Codex's hook trust prompt.
@@ -56,7 +56,7 @@ The beta is unsigned, so SmartScreen may warn. Verify the published SHA-256 and 
 
 ### macOS Universal
 
-Extract `XiaoLi-v0.1.0-beta.1-macOS-universal.app.zip`, move `XiaoLi.app` to Applications, and open it. The beta is ad-hoc signed but not notarized. If Gatekeeper blocks it, verify the download and use Privacy & Security's “Open Anyway” control. Do not disable Gatekeeper.
+Extract `XiaoLi-v0.1.0-beta.2-macOS-universal.app.zip`, move `XiaoLi.app` to Applications, and open it. The beta is ad-hoc signed but not notarized. If Gatekeeper blocks it, verify the download and use Privacy & Security's “Open Anyway” control. Do not disable Gatekeeper.
 
 ### Linux x64
 

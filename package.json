@@ -1,7 +1,7 @@
 {
   "name": "xiaoli",
   "private": true,
-  "version": "0.1.0-beta.1",
+  "version": "0.1.0-beta.2",
   "description": "Evidence-aware Codex model, token, cache and timing monitor",
   "author": "XuYing1128",
   "license": "PolyForm-Noncommercial-1.0.0",
