@@ -102,10 +102,14 @@ fn resize_crop_premultiplied(
                 }
             }
             let target = (output_y * output_size + output_x) * 4;
-            if alpha_sum > 0 {
-                output[target] = (premultiplied[0] / alpha_sum) as u8;
-                output[target + 1] = (premultiplied[1] / alpha_sum) as u8;
-                output[target + 2] = (premultiplied[2] / alpha_sum) as u8;
+            if let (Some(red), Some(green), Some(blue)) = (
+                premultiplied[0].checked_div(alpha_sum),
+                premultiplied[1].checked_div(alpha_sum),
+                premultiplied[2].checked_div(alpha_sum),
+            ) {
+                output[target] = red as u8;
+                output[target + 1] = green as u8;
+                output[target + 2] = blue as u8;
             }
             output[target + 3] = (alpha_sum / samples) as u8;
         }

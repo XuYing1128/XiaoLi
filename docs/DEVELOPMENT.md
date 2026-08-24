@@ -21,7 +21,7 @@ session_index.jsonl ─┘          │                      ├─> read-only M
 
 ## 依赖
 
-- Rust stable，Windows 使用 MSVC toolchain。
+- Rust 1.89.0（发布与 CI 固定版本），Windows 使用 MSVC toolchain。
 - Node.js 20+ 与 pnpm 9+ 只用于开发前端，不是发布运行时依赖。
 - Tauri 2 系统依赖；Linux 需要 WebKitGTK 4.1、AppIndicator、librsvg 与 patchelf。
 
