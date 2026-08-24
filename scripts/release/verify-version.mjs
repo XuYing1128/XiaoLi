@@ -5,16 +5,21 @@ if (!expected) throw new Error("Expected version argument is required");
 const packageJson = JSON.parse(readFileSync("package.json", "utf8"));
 const tauri = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
 const cargo = readFileSync("src-tauri/Cargo.toml", "utf8");
+const runtime = readFileSync("src-tauri/src/lib.rs", "utf8");
 const plugin = JSON.parse(
   readFileSync("plugin/xiaoli-model-monitor/.codex-plugin/plugin.json", "utf8"),
 );
 const cargoVersion = cargo.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 const cargoLicense = cargo.match(/^license\s*=\s*"([^"]+)"/m)?.[1];
+const runtimePluginVersion = runtime.match(
+  /^const PLUGIN_VERSION:\s*&str\s*=\s*"([^"]+)";/m,
+)?.[1];
 const versions = {
   "package.json": packageJson.version,
   "tauri.conf.json": tauri.version,
   "Cargo.toml": cargoVersion,
   "plugin.json": plugin.version,
+  "src-tauri/src/lib.rs PLUGIN_VERSION": runtimePluginVersion,
 };
 for (const [source, version] of Object.entries(versions)) {
   if (version !== expected) throw new Error(`${source}: expected ${expected}, received ${version}`);
