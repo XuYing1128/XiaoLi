@@ -8,7 +8,7 @@ MSI, DMG, DEB, or RPM installers.
 - `.github/workflows/ci.yml` runs secret scanning, plugin validation, frontend
   type checking, Rust formatting/lint/tests, a native Tauri `--no-bundle`
   build, and CLI/hook/MCP smoke tests on Windows, macOS, and Ubuntu.
-- `.github/workflows/release.yml` accepts only `v0.1.0-beta.1`, builds all three
+- `.github/workflows/release.yml` accepts only `v0.1.0-beta.2`, builds all three
   platforms independently, assembles the complete asset set, verifies every
   checksum, and only then creates or updates a draft GitHub Release. The draft
   becomes a prerelease after all assets have uploaded and the remote asset
@@ -21,13 +21,13 @@ Every third-party GitHub Action is pinned to a full commit SHA.
 
 The completeness validator requires exactly:
 
-- `XiaoLi-v0.1.0-beta.1-Windows-x64-portable.zip`
-- `XiaoLi-v0.1.0-beta.1-macOS-universal.app.zip`
-- `XiaoLi-v0.1.0-beta.1-Linux-x64-portable.tar.gz`
-- `XiaoLi-v0.1.0-beta.1-Linux-x64-portable.zip`
-- `xiaoli-codex-plugin-v0.1.0-beta.1.zip`
+- `XiaoLi-v0.1.0-beta.2-Windows-x64-portable.zip`
+- `XiaoLi-v0.1.0-beta.2-macOS-universal.app.zip`
+- `XiaoLi-v0.1.0-beta.2-Linux-x64-portable.tar.gz`
+- `XiaoLi-v0.1.0-beta.2-Linux-x64-portable.zip`
+- `xiaoli-codex-plugin-v0.1.0-beta.2.zip`
 - `THIRD_PARTY_LICENSES.html`
-- `XiaoLi-v0.1.0-beta.1.spdx.json`
+- `XiaoLi-v0.1.0-beta.2.spdx.json`
 - `SHA256SUMS.txt`
 
 Portable app archives retain the root README documents, `docs/`, the icon used
@@ -43,7 +43,7 @@ texts come from the exact locked `spdx-license-list` development dependency.
 From the repository root on Windows:
 
 ```powershell
-node scripts/release/verify-version.mjs 0.1.0-beta.1
+node scripts/release/verify-version.mjs 0.1.0-beta.2
 node scripts/release/validate-plugin.mjs plugin/xiaoli-model-monitor
 node scripts/release/generate-third-party-licenses.mjs release-out/THIRD_PARTY_LICENSES.html
 ./scripts/release/Test-Portable.ps1 `
@@ -52,15 +52,15 @@ node scripts/release/generate-third-party-licenses.mjs release-out/THIRD_PARTY_L
 ./scripts/release/Package-Windows.ps1 `
   -Executable src-tauri/target/release/xiaoli.exe `
   -OutputDirectory release-out `
-  -Version 0.1.0-beta.1
+  -Version 0.1.0-beta.2
 ./scripts/release/Test-WindowsArchive.ps1 `
-  -Archive release-out/XiaoLi-v0.1.0-beta.1-Windows-x64-portable.zip `
+  -Archive release-out/XiaoLi-v0.1.0-beta.2-Windows-x64-portable.zip `
   -ScratchRoot release-out/archive-smoke
 ./scripts/release/Package-Plugin.ps1 `
   -OutputDirectory release-out `
-  -Version 0.1.0-beta.1
+  -Version 0.1.0-beta.2
 ./scripts/release/Test-PluginArchive.ps1 `
-  -Archive release-out/xiaoli-codex-plugin-v0.1.0-beta.1.zip `
+  -Archive release-out/xiaoli-codex-plugin-v0.1.0-beta.2.zip `
   -ScratchRoot release-out/plugin-smoke
 ```
 

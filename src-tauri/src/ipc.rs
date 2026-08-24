@@ -260,13 +260,41 @@ fn read_bounded_line(
     timeout: Duration,
 ) -> io::Result<String> {
     stream.set_nonblocking(true)?;
+    let result = read_bounded_line_nonblocking(stream, max_bytes, timeout);
+    let restore_result = stream.set_nonblocking(false);
+    match (result, restore_result) {
+        (Ok(line), Ok(())) => Ok(line),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn read_bounded_line_nonblocking(
+    stream: &mut Stream,
+    max_bytes: usize,
+    timeout: Duration,
+) -> io::Result<String> {
     let deadline = Instant::now() + timeout;
     let mut bytes = Vec::with_capacity(512.min(max_bytes));
     let mut buffer = [0_u8; 1024];
-    let mut complete = false;
     loop {
         match stream.read(&mut buffer) {
-            Ok(0) => break,
+            Ok(0) => {
+                #[cfg(windows)]
+                {
+                    // Windows PIPE_NOWAIT reports a temporarily empty byte
+                    // pipe as a successful zero-byte read. The peer can still
+                    // be connected and about to write, so wait until the hard
+                    // deadline instead of misclassifying this as EOF.
+                    wait_for_ipc_data(deadline)?;
+                    continue;
+                }
+                #[cfg(not(windows))]
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "IPC connection closed before newline",
+                ));
+            }
             Ok(read) => {
                 let end = buffer[..read]
                     .iter()
@@ -280,31 +308,29 @@ fn read_bounded_line(
                 }
                 bytes.extend_from_slice(&buffer[..end]);
                 if end < read || bytes.last() == Some(&b'\n') {
-                    complete = true;
-                    break;
+                    return String::from_utf8(bytes).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "IPC line is not UTF-8")
+                    });
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "IPC line timed out",
-                    ));
-                }
-                thread::sleep(Duration::from_millis(2));
+                wait_for_ipc_data(deadline)?;
             }
             Err(error) => return Err(error),
         }
     }
-    if !complete {
+}
+
+fn wait_for_ipc_data(deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline {
         return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "IPC connection closed before newline",
+            io::ErrorKind::TimedOut,
+            "IPC line timed out",
         ));
     }
-    String::from_utf8(bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "IPC line is not UTF-8"))
+    thread::sleep(Duration::from_millis(2));
+    Ok(())
 }
 
 fn write_atomic_json(path: &Path, value: &Value) -> Result<(), String> {
@@ -524,6 +550,239 @@ fn secure_listener_options(options: ListenerOptions<'_>) -> Result<ListenerOptio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    };
+
+    static NEXT_ENDPOINT: AtomicU64 = AtomicU64::new(1);
+
+    fn unique_test_endpoint(label: &str) -> LocalEndpoint {
+        let nonce = NEXT_ENDPOINT.fetch_add(1, Ordering::Relaxed);
+        #[cfg(windows)]
+        {
+            LocalEndpoint::NamedPipe(format!(
+                "OpenAI.Codex.ModelMonitor.Test.{label}.{}.{nonce}",
+                std::process::id()
+            ))
+        }
+        #[cfg(not(windows))]
+        {
+            LocalEndpoint::UnixSocket(std::env::temp_dir().join(format!(
+                "xiaoli-ipc-{label}-{}-{nonce}.sock",
+                std::process::id()
+            )))
+        }
+    }
+
+    fn cleanup_test_endpoint(endpoint: &LocalEndpoint) {
+        #[cfg(not(windows))]
+        match endpoint {
+            LocalEndpoint::UnixSocket(path) => {
+                let _ = fs::remove_file(path);
+            }
+        }
+        #[cfg(windows)]
+        let _ = endpoint;
+    }
+
+    fn read_test_payload(label: &str, max_bytes: usize, chunks: &[&[u8]]) -> io::Result<String> {
+        let endpoint = unique_test_endpoint(label);
+        let listener = endpoint.create_listener().expect("test IPC listener");
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(0);
+        let server = thread::spawn(move || {
+            let mut connection = listener
+                .incoming()
+                .next()
+                .expect("incoming stream")
+                .expect("accepted stream");
+            accepted_tx.send(()).expect("signal accepted stream");
+            read_bounded_line(&mut connection, max_bytes, Duration::from_millis(500))
+        });
+
+        let mut client = endpoint.connect().expect("test IPC client");
+        accepted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should accept the test client");
+        for chunk in chunks {
+            client.write_all(chunk).expect("write test payload chunk");
+            client.flush().expect("flush test payload chunk");
+        }
+        drop(client);
+
+        let result = server.join().expect("server thread");
+        cleanup_test_endpoint(&endpoint);
+        result
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_nonblocking_pipe_waits_for_a_delayed_first_byte() {
+        let endpoint = unique_test_endpoint("delayed-first-byte");
+        let listener = endpoint.create_listener().expect("test pipe listener");
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(0);
+        let server = thread::spawn(move || {
+            let mut connection = listener
+                .incoming()
+                .next()
+                .expect("incoming stream")
+                .expect("accepted stream");
+            accepted_tx.send(()).expect("signal accepted stream");
+            read_bounded_line(&mut connection, 1024, Duration::from_millis(500))
+        });
+
+        let mut client = endpoint.connect().expect("test pipe client");
+        accepted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should accept before the delayed write");
+        // The acceptance barrier makes the server ready before this deliberate
+        // delay. That gives read_bounded_line a stable empty PIPE_NOWAIT poll
+        // before the first request byte arrives.
+        thread::sleep(Duration::from_millis(50));
+        client
+            .write_all(b"{\"method\":\"ping\"}\n")
+            .expect("write delayed request");
+        client.flush().expect("flush delayed request");
+
+        let received = server
+            .join()
+            .expect("server thread")
+            .expect("server should wait for the delayed request");
+        assert_eq!(received, "{\"method\":\"ping\"}\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_read_restores_blocking_mode_before_a_large_response() {
+        let endpoint = unique_test_endpoint("blocking-response");
+        let listener = endpoint.create_listener().expect("test pipe listener");
+        let response = vec![b'x'; 1024 * 1024];
+        let expected_len = response.len();
+        let (writing_tx, writing_rx) = mpsc::sync_channel(0);
+        let server = thread::spawn(move || {
+            let mut connection = listener
+                .incoming()
+                .next()
+                .expect("incoming stream")
+                .expect("accepted stream");
+            let request = read_bounded_line(&mut connection, 1024, Duration::from_millis(500))?;
+            assert_eq!(request, "{\"method\":\"large\"}\n");
+            writing_tx
+                .send(())
+                .expect("signal before writing the large response");
+            connection.write_all(&response)
+        });
+
+        let mut client = endpoint.connect().expect("test pipe client");
+        client
+            .write_all(b"{\"method\":\"large\"}\n")
+            .expect("write request");
+        client.flush().expect("flush request");
+        writing_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should reach the large response write");
+        // The barrier proves the server is at write_all before the client
+        // deliberately waits. A stream left in PIPE_NOWAIT fills its pipe
+        // buffer and turns write_all into WriteZero here.
+        thread::sleep(Duration::from_millis(100));
+        let mut received = Vec::with_capacity(expected_len);
+        client
+            .read_to_end(&mut received)
+            .expect("read complete response");
+
+        server
+            .join()
+            .expect("server thread")
+            .expect("large response should use restored blocking mode");
+        assert_eq!(received.len(), expected_len);
+        assert!(received.iter().all(|byte| *byte == b'x'));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn timed_out_client_does_not_block_the_next_pipe_connection() {
+        let endpoint = unique_test_endpoint("timeout-recovery");
+        let listener = endpoint.create_listener().expect("test pipe listener");
+        let (first_accepted_tx, first_accepted_rx) = mpsc::sync_channel(0);
+        let (first_done_tx, first_done_rx) = mpsc::sync_channel(0);
+        let server = thread::spawn(move || -> io::Result<String> {
+            let mut stalled = listener.incoming().next().expect("first incoming stream")?;
+            first_accepted_tx
+                .send(())
+                .expect("signal first accepted stream");
+            let error = read_bounded_line(&mut stalled, 1024, Duration::from_millis(100))
+                .expect_err("silent client must time out");
+            first_done_tx
+                .send(error.kind())
+                .expect("signal first read result");
+            drop(stalled);
+
+            let mut healthy = listener
+                .incoming()
+                .next()
+                .expect("second incoming stream")?;
+            read_bounded_line(&mut healthy, 1024, Duration::from_millis(500))
+        });
+
+        let stalled_client = endpoint.connect().expect("stalled test pipe client");
+        first_accepted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should accept the stalled client");
+        assert_eq!(
+            first_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("silent client should hit the hard deadline"),
+            io::ErrorKind::TimedOut
+        );
+
+        let mut healthy_client = endpoint.connect().expect("healthy test pipe client");
+        healthy_client
+            .write_all(b"{\"method\":\"ping\"}\n")
+            .expect("write healthy request");
+        healthy_client.flush().expect("flush healthy request");
+
+        let received = server
+            .join()
+            .expect("server thread")
+            .expect("listener should recover for the next client");
+        drop(stalled_client);
+        assert_eq!(received, "{\"method\":\"ping\"}\n");
+    }
+
+    #[test]
+    fn bounded_read_assembles_a_line_across_multiple_reads() {
+        let first = vec![b'a'; 1500];
+        let result = read_test_payload("partial-line", 4096, &[&first, b"tail\n"])
+            .expect("split line should be reassembled");
+        assert_eq!(result.len(), first.len() + 5);
+        assert!(result.starts_with(&"a".repeat(first.len())));
+        assert!(result.ends_with("tail\n"));
+    }
+
+    #[test]
+    fn bounded_read_rejects_a_line_over_the_size_limit() {
+        let error = read_test_payload("oversized-line", 8, &[b"123456789\n"])
+            .expect_err("oversized line must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "IPC line exceeds size limit");
+    }
+
+    #[test]
+    fn bounded_read_rejects_invalid_utf8() {
+        let error = read_test_payload("invalid-utf8", 16, &[&[0xff, b'\n']])
+            .expect_err("invalid UTF-8 must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "IPC line is not UTF-8");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_peer_close_before_newline_is_unexpected_eof() {
+        let error = read_test_payload("unix-eof", 1024, &[b"partial"])
+            .expect_err("Unix peer close before newline must be EOF");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "IPC connection closed before newline");
+    }
 
     #[test]
     fn pipe_name_contains_only_safe_namespace_characters() {

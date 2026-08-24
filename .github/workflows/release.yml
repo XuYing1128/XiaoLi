@@ -9,7 +9,7 @@ on:
       tag:
         description: Existing v-prefixed tag to package
         required: true
-        default: v0.1.0-beta.1
+        default: v0.1.0-beta.2
 
 permissions:
   contents: read
@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  XIAOLI_VERSION: 0.1.0-beta.1
+  XIAOLI_VERSION: 0.1.0-beta.2
 
 jobs:
   validate-ref:
@@ -277,7 +277,7 @@ jobs:
         with:
           path: .
           format: spdx-json
-          output-file: release-out/XiaoLi-v0.1.0-beta.1.spdx.json
+          output-file: release-out/XiaoLi-v0.1.0-beta.2.spdx.json
           upload-artifact: false
           # Publishing is deliberately centralized in the final job. Anchore's
           # default would otherwise attach to a draft left by a failed run and

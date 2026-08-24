@@ -1,6 +1,6 @@
 {
   "name": "xiaoli-model-monitor",
-  "version": "0.1.0-beta.1",
+  "version": "0.1.0-beta.2",
   "description": "小狸提供只读的 Codex 请求模型、effort、路由证据、token、缓存、时序与质量评估。",
   "author": {
     "name": "XuYing1128",

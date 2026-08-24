@@ -75,7 +75,7 @@
 
 ## Windows SmartScreen 或 macOS Gatekeeper 警告
 
-`v0.1.0-beta.1` 没有正式代码签名或公证。ZIP 不会绕过平台保护。
+`v0.1.0-beta.2` 没有正式代码签名或公证。ZIP 不会绕过平台保护。
 
 1. 从项目 GitHub Release 下载。
 2. 对照 `SHA256SUMS.txt`。

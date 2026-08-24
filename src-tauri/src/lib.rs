@@ -20,7 +20,7 @@ use std::{
 };
 
 const PLUGIN_NAME: &str = "xiaoli-model-monitor";
-const PLUGIN_VERSION: &str = "0.1.0-beta.1";
+const PLUGIN_VERSION: &str = "0.1.0-beta.2";
 const MAX_HOOK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MCP_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 // Reserve most of the 150 ms fail-open budget for cold process startup and
