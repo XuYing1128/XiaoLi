@@ -863,30 +863,21 @@ mod tests {
         accepted_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("server should accept the client");
-        let (reader_started_tx, reader_started_rx) = mpsc::sync_channel(0);
-        let (reader_result_tx, reader_result_rx) = mpsc::sync_channel(1);
-        let client_reader = thread::spawn(move || {
-            reader_started_tx.send(()).expect("signal client read");
-            let result = read_bounded_line(&mut client, 1024, Duration::from_secs(1));
-            reader_result_tx
-                .send(result)
-                .expect("return client read result");
-        });
-        reader_started_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("client reader should start");
-        assert!(matches!(
-            reader_result_rx.recv_timeout(Duration::from_millis(100)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-
+        // Set PIPE_NOWAIT while the peer is definitely connected, then close
+        // the peer before the read. interprocess maps the resulting 109/233
+        // to Ok(0), so this deterministically exercises the PeekNamedPipe path
+        // rather than failing earlier during the mode switch.
+        client
+            .set_nonblocking(true)
+            .expect("connected client should enter PIPE_NOWAIT");
         allow_close_tx.send(()).expect("close the server peer");
         server.join().expect("server thread");
-        let error = reader_result_rx
-            .recv_timeout(Duration::from_millis(500))
-            .expect("peer close should be detected before the hard deadline")
-            .expect_err("peer close cannot produce a complete line");
-        client_reader.join().expect("client reader thread");
+        let error = read_bounded_line_nonblocking(
+            &mut client,
+            1024,
+            Instant::now() + Duration::from_millis(100),
+        )
+        .expect_err("peer close cannot produce a complete line");
         assert_ne!(error.kind(), io::ErrorKind::TimedOut);
         assert!(matches!(error.raw_os_error(), Some(109 | 233)));
     }
