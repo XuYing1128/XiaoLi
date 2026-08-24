@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 4,
+  "checkedAt": "2030-01-01T00:00:12.000Z",
+  "codexRunning": true,
+  "collectorHealth": {
+    "level": "green",
+    "parseWarnings": 0
+  },
+  "conversations": [
+    {
+      "threadId": "thread-example-root-0001",
+      "turnId": "turn-example-0001",
+      "kind": "root",
+      "title": "合成示例任务",
+      "sourceTimestamp": "2030-01-01T00:00:11.500Z",
+      "activeRequest": {
+        "model": "gpt-5.6-sol",
+        "effort": "ultra",
+        "source": "turnContext"
+      },
+      "serverRoute": {
+        "evidence": "notObserved",
+        "chain": []
+      },
+      "usage": {
+        "last": {
+          "inputTokens": 12000,
+          "cachedInputTokens": 8400,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 240,
+          "reasoningOutputTokens": 90,
+          "totalTokens": 12240
+        },
+        "cumulative": {
+          "inputTokens": 42000,
+          "cachedInputTokens": 31000,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 2400,
+          "reasoningOutputTokens": 900,
+          "totalTokens": 44400
+        },
+        "lastCacheInputShare": 0.7,
+        "cacheInputShare": 0.7381,
+        "contextWindow": 400000,
+        "contextInputShare": 0.105
+      },
+      "timing": {
+        "elapsedMs": 12000,
+        "ttftEvidence": {
+          "kind": "estimatedWindow",
+          "lowerMs": 820,
+          "upperMs": 1450
+        },
+        "modelActiveMs": 6800,
+        "endToEndOutputRate": 20.0,
+        "modelPhaseOutputRate": 35.2941,
+        "observedOutputRate": 20.0
+      },
+      "toolActivity": false,
+      "status": {
+        "level": "green",
+        "code": "request_configuration_consistent",
+        "explanation": "请求配置一致，采集字段完整。"
+      },
+      "qualityAssessment": {
+        "state": "learning",
+        "baselineKey": "gpt-5.6-sol|ultra|8k-32k|0-256|no-tools",
+        "baselineSampleCount": 12,
+        "consecutiveHits": 0,
+        "factors": [],
+        "limitations": [
+          "同桶健康样本不足 30 个；行为统计不能证明服务器物理模型。"
+        ]
+      },
+      "anomalies": []
+    }
+  ]
+}

@@ -1,0 +1,72 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+src-tauri/target/
+src-tauri/target*/
+target/
+
+# Local collector state and production/shadow probes
+edge-profile-test/
+race-state/
+shadow-state/
+*-state/
+artifacts/
+*.db
+*.db-shm
+*.db-wal
+monitor.jsonl*
+latest-snapshot.json
+ipc-endpoint.json
+pipe-name.json
+*probe*.json
+*probe*.err
+*smoke*.json
+*smoke*.err
+*report*.json
+production-baseline*.json
+
+# Real-device screenshots and local visual QA captures. Public docs use only
+# synthetic fixture captures under docs/assets/.
+*.png
+*.jpg
+*.jpeg
+!src/assets/*.png
+!src-tauri/icons/*.png
+!src-tauri/icons/tray/*.png
+!plugin/**/assets/*.png
+!docs/assets/*.png
+!docs/assets/*.jpg
+/app-icon.svg
+/src-tauri/icons/android/
+/src-tauri/icons/ios/
+
+# Portable/release output
+release-out*/
+release-staging/
+*.AppImage
+*.dmg
+*.msi
+*.exe.zip
+SHA256SUMS.txt
+*.spdx.json
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

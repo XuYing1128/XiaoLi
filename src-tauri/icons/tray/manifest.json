@@ -1,0 +1,317 @@
+{
+  "assets": [
+    {
+      "alphaBounds": {
+        "height": 16,
+        "width": 16,
+        "x": 0,
+        "y": 0
+      },
+      "file": "green-16.png",
+      "hasAlpha": true,
+      "opaquePixels": 55,
+      "pngFnv1a64": "dfd875f570004d14",
+      "rgbaFnv1a64": "ab2b874b843f811e",
+      "size": 16,
+      "state": "green",
+      "statusColor": "#2F9C6A",
+      "translucentPixels": 157,
+      "visiblePixels": 212
+    },
+    {
+      "alphaBounds": {
+        "height": 20,
+        "width": 20,
+        "x": 0,
+        "y": 0
+      },
+      "file": "green-20.png",
+      "hasAlpha": true,
+      "opaquePixels": 76,
+      "pngFnv1a64": "a5b5292eb0f0e9de",
+      "rgbaFnv1a64": "bc6c3df51f4782df",
+      "size": 20,
+      "state": "green",
+      "statusColor": "#2F9C6A",
+      "translucentPixels": 266,
+      "visiblePixels": 342
+    },
+    {
+      "alphaBounds": {
+        "height": 24,
+        "width": 24,
+        "x": 0,
+        "y": 0
+      },
+      "file": "green-24.png",
+      "hasAlpha": true,
+      "opaquePixels": 122,
+      "pngFnv1a64": "7e17ab51c4204ed7",
+      "rgbaFnv1a64": "cabb9399de816eed",
+      "size": 24,
+      "state": "green",
+      "statusColor": "#2F9C6A",
+      "translucentPixels": 348,
+      "visiblePixels": 470
+    },
+    {
+      "alphaBounds": {
+        "height": 32,
+        "width": 32,
+        "x": 0,
+        "y": 0
+      },
+      "file": "green-32.png",
+      "hasAlpha": true,
+      "opaquePixels": 334,
+      "pngFnv1a64": "1ef422b3f0bf5159",
+      "rgbaFnv1a64": "6445c8957c7df326",
+      "size": 32,
+      "state": "green",
+      "statusColor": "#2F9C6A",
+      "translucentPixels": 400,
+      "visiblePixels": 734
+    },
+    {
+      "alphaBounds": {
+        "height": 16,
+        "width": 16,
+        "x": 0,
+        "y": 0
+      },
+      "file": "yellow-16.png",
+      "hasAlpha": true,
+      "opaquePixels": 55,
+      "pngFnv1a64": "3e552f573f6cf7e4",
+      "rgbaFnv1a64": "82b6ed84eaa2aa88",
+      "size": 16,
+      "state": "yellow",
+      "statusColor": "#B87812",
+      "translucentPixels": 157,
+      "visiblePixels": 212
+    },
+    {
+      "alphaBounds": {
+        "height": 20,
+        "width": 20,
+        "x": 0,
+        "y": 0
+      },
+      "file": "yellow-20.png",
+      "hasAlpha": true,
+      "opaquePixels": 76,
+      "pngFnv1a64": "d99873875b701a26",
+      "rgbaFnv1a64": "f0496648c59ce835",
+      "size": 20,
+      "state": "yellow",
+      "statusColor": "#B87812",
+      "translucentPixels": 266,
+      "visiblePixels": 342
+    },
+    {
+      "alphaBounds": {
+        "height": 24,
+        "width": 24,
+        "x": 0,
+        "y": 0
+      },
+      "file": "yellow-24.png",
+      "hasAlpha": true,
+      "opaquePixels": 122,
+      "pngFnv1a64": "734be71e8bc1360d",
+      "rgbaFnv1a64": "511c4069e3ede43b",
+      "size": 24,
+      "state": "yellow",
+      "statusColor": "#B87812",
+      "translucentPixels": 348,
+      "visiblePixels": 470
+    },
+    {
+      "alphaBounds": {
+        "height": 32,
+        "width": 32,
+        "x": 0,
+        "y": 0
+      },
+      "file": "yellow-32.png",
+      "hasAlpha": true,
+      "opaquePixels": 334,
+      "pngFnv1a64": "0fa96c845d57b75c",
+      "rgbaFnv1a64": "3c231767e49135df",
+      "size": 32,
+      "state": "yellow",
+      "statusColor": "#B87812",
+      "translucentPixels": 400,
+      "visiblePixels": 734
+    },
+    {
+      "alphaBounds": {
+        "height": 16,
+        "width": 16,
+        "x": 0,
+        "y": 0
+      },
+      "file": "red-16.png",
+      "hasAlpha": true,
+      "opaquePixels": 55,
+      "pngFnv1a64": "180bf19ba714ddbe",
+      "rgbaFnv1a64": "712a36e72cd11113",
+      "size": 16,
+      "state": "red",
+      "statusColor": "#D84861",
+      "translucentPixels": 157,
+      "visiblePixels": 212
+    },
+    {
+      "alphaBounds": {
+        "height": 20,
+        "width": 20,
+        "x": 0,
+        "y": 0
+      },
+      "file": "red-20.png",
+      "hasAlpha": true,
+      "opaquePixels": 76,
+      "pngFnv1a64": "9b8a45d9c6390591",
+      "rgbaFnv1a64": "2b2a9574b1da9e77",
+      "size": 20,
+      "state": "red",
+      "statusColor": "#D84861",
+      "translucentPixels": 266,
+      "visiblePixels": 342
+    },
+    {
+      "alphaBounds": {
+        "height": 24,
+        "width": 24,
+        "x": 0,
+        "y": 0
+      },
+      "file": "red-24.png",
+      "hasAlpha": true,
+      "opaquePixels": 122,
+      "pngFnv1a64": "12a4554c7a14a025",
+      "rgbaFnv1a64": "1ce4320e56478215",
+      "size": 24,
+      "state": "red",
+      "statusColor": "#D84861",
+      "translucentPixels": 348,
+      "visiblePixels": 470
+    },
+    {
+      "alphaBounds": {
+        "height": 32,
+        "width": 32,
+        "x": 0,
+        "y": 0
+      },
+      "file": "red-32.png",
+      "hasAlpha": true,
+      "opaquePixels": 334,
+      "pngFnv1a64": "1e2b0a1b497ee740",
+      "rgbaFnv1a64": "e96e0c2cda2c2501",
+      "size": 32,
+      "state": "red",
+      "statusColor": "#D84861",
+      "translucentPixels": 400,
+      "visiblePixels": 734
+    },
+    {
+      "alphaBounds": {
+        "height": 16,
+        "width": 16,
+        "x": 0,
+        "y": 0
+      },
+      "file": "gray-16.png",
+      "hasAlpha": true,
+      "opaquePixels": 55,
+      "pngFnv1a64": "1b8de6689a185103",
+      "rgbaFnv1a64": "a3d66c352c385187",
+      "size": 16,
+      "state": "gray",
+      "statusColor": "#817882",
+      "translucentPixels": 157,
+      "visiblePixels": 212
+    },
+    {
+      "alphaBounds": {
+        "height": 20,
+        "width": 20,
+        "x": 0,
+        "y": 0
+      },
+      "file": "gray-20.png",
+      "hasAlpha": true,
+      "opaquePixels": 76,
+      "pngFnv1a64": "7ddf0580f1df61db",
+      "rgbaFnv1a64": "b244fee54feb57a9",
+      "size": 20,
+      "state": "gray",
+      "statusColor": "#817882",
+      "translucentPixels": 266,
+      "visiblePixels": 342
+    },
+    {
+      "alphaBounds": {
+        "height": 24,
+        "width": 24,
+        "x": 0,
+        "y": 0
+      },
+      "file": "gray-24.png",
+      "hasAlpha": true,
+      "opaquePixels": 122,
+      "pngFnv1a64": "267037f8bd87307c",
+      "rgbaFnv1a64": "c61beb639e357fae",
+      "size": 24,
+      "state": "gray",
+      "statusColor": "#817882",
+      "translucentPixels": 348,
+      "visiblePixels": 470
+    },
+    {
+      "alphaBounds": {
+        "height": 32,
+        "width": 32,
+        "x": 0,
+        "y": 0
+      },
+      "file": "gray-32.png",
+      "hasAlpha": true,
+      "opaquePixels": 334,
+      "pngFnv1a64": "39eb1175d3b9ab76",
+      "rgbaFnv1a64": "5d5bd48b4ec15059",
+      "size": 32,
+      "state": "gray",
+      "statusColor": "#817882",
+      "translucentPixels": 400,
+      "visiblePixels": 734
+    }
+  ],
+  "checklist": {
+    "lightAndDarkTaskbarContrast": "covered by tray_icon_stays_legible_at_windows_taskbar_sizes",
+    "normalBuildWritesSourceTree": false,
+    "regeneratePowerShell": "$env:MOCHI_EXPORT_TRAY_ASSETS='1'; cargo test app::tests::export_runtime_tray_assets_when_explicitly_requested --lib -- --exact",
+    "runtimeRendererReused": true,
+    "subagentStatusBubbles": "covered by subagent_red_bubbles_to_tray_level",
+    "transparentRgba": true
+  },
+  "hashAlgorithm": "FNV-1a-64",
+  "master": "../tray-master.png",
+  "resizeAlgorithm": "premultiplied-area",
+  "schemaVersion": 1,
+  "sizes": [
+    16,
+    20,
+    24,
+    32
+  ],
+  "source": "render_tray_status_rgba",
+  "states": [
+    "green",
+    "yellow",
+    "red",
+    "gray"
+  ]
+}

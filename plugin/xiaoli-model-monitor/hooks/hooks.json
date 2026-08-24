@@ -1,0 +1,70 @@
+{
+  "description": "Fail-open, metadata-only XiaoLi hooks. The Rust handler discards prompt, cwd, transcript paths, tool data, and message bodies.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{XIAOLI_EXECUTABLE}}\" --hook-capture \"${PLUGIN_DATA}\"",
+            "commandWindows": "\"{{XIAOLI_EXECUTABLE}}\" --hook-capture \"${PLUGIN_DATA}\"",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{XIAOLI_EXECUTABLE}}\" --hook-capture \"${PLUGIN_DATA}\"",
+            "commandWindows": "\"{{XIAOLI_EXECUTABLE}}\" --hook-capture \"${PLUGIN_DATA}\"",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{XIAOLI_EXECUTABLE}}\" --hook-capture \"${PLUGIN_DATA}\"",
+            "commandWindows": "\"{{XIAOLI_EXECUTABLE}}\" --hook-capture \"${PLUGIN_DATA}\"",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{XIAOLI_EXECUTABLE}}\" --hook-capture \"${PLUGIN_DATA}\"",
+            "commandWindows": "\"{{XIAOLI_EXECUTABLE}}\" --hook-capture \"${PLUGIN_DATA}\"",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{XIAOLI_EXECUTABLE}}\" --hook-capture \"${PLUGIN_DATA}\"",
+            "commandWindows": "\"{{XIAOLI_EXECUTABLE}}\" --hook-capture \"${PLUGIN_DATA}\"",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
