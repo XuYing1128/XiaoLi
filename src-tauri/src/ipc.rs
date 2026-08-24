@@ -302,11 +302,11 @@ fn read_bounded_line_nonblocking(
             Ok(0) => {
                 #[cfg(windows)]
                 {
-                    // Windows PIPE_NOWAIT reports a temporarily empty byte
-                    // pipe as a successful zero-byte read. The peer can still
-                    // be connected and about to write, so wait until the hard
-                    // deadline instead of misclassifying this as EOF.
-                    wait_for_ipc_data(deadline)?;
+                    // interprocess maps both an empty PIPE_NOWAIT byte pipe
+                    // and a disconnected byte pipe to Ok(0). PeekNamedPipe
+                    // distinguishes a connected empty pipe from EOF before
+                    // the bounded poll waits again.
+                    wait_for_windows_pipe_data(stream, deadline)?;
                     continue;
                 }
                 #[cfg(not(windows))]
@@ -372,6 +372,28 @@ fn is_windows_pipe_read_empty(error: &io::Error) -> bool {
         let _ = error;
         false
     }
+}
+
+#[cfg(windows)]
+fn wait_for_windows_pipe_data(stream: &Stream, deadline: Instant) -> io::Result<()> {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let Stream::NamedPipe(pipe) = stream;
+    let result = unsafe {
+        PeekNamedPipe(
+            pipe.as_handle().as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    wait_for_ipc_data(deadline)
 }
 
 fn wait_for_ipc_data(deadline: Instant) -> io::Result<()> {
@@ -815,6 +837,58 @@ mod tests {
         assert!(is_windows_pipe_read_empty(&no_data));
         assert!(!is_windows_pipe_read_empty(&pipe_busy));
         assert!(!is_windows_pipe_read_empty(&broken_pipe));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_peer_close_does_not_wait_for_the_read_deadline() {
+        let endpoint = unique_test_endpoint("peer-close");
+        let listener = endpoint.create_listener().expect("test pipe listener");
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(0);
+        let (allow_close_tx, allow_close_rx) = mpsc::sync_channel(0);
+        let server = thread::spawn(move || {
+            let connection = listener
+                .incoming()
+                .next()
+                .expect("incoming stream")
+                .expect("accepted stream");
+            accepted_tx.send(()).expect("signal accepted stream");
+            allow_close_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("client should allow the peer close");
+            drop(connection);
+        });
+
+        let mut client = endpoint.connect().expect("test pipe client");
+        accepted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should accept the client");
+        let (reader_started_tx, reader_started_rx) = mpsc::sync_channel(0);
+        let (reader_result_tx, reader_result_rx) = mpsc::sync_channel(1);
+        let client_reader = thread::spawn(move || {
+            reader_started_tx.send(()).expect("signal client read");
+            let result = read_bounded_line(&mut client, 1024, Duration::from_secs(1));
+            reader_result_tx
+                .send(result)
+                .expect("return client read result");
+        });
+        reader_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("client reader should start");
+        assert!(matches!(
+            reader_result_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        allow_close_tx.send(()).expect("close the server peer");
+        server.join().expect("server thread");
+        let error = reader_result_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("peer close should be detected before the hard deadline")
+            .expect_err("peer close cannot produce a complete line");
+        client_reader.join().expect("client reader thread");
+        assert_ne!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(matches!(error.raw_os_error(), Some(109 | 233)));
     }
 
     #[cfg(windows)]
