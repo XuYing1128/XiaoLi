@@ -242,15 +242,19 @@ pub fn send_request(payload: &Value) -> Result<Value, String> {
 
 pub fn send_request_at(state_root: &Path, payload: &Value) -> Result<Value, String> {
     let endpoint = connect_endpoint(state_root)?;
-    let mut stream = endpoint.connect()?;
+    let mut stream = endpoint
+        .connect()
+        .map_err(|error| format!("connect IPC endpoint: {error}"))?;
     let mut request = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
     request.push(b'\n');
     stream
         .write_all(&request)
-        .map_err(|error| error.to_string())?;
-    stream.flush().map_err(|error| error.to_string())?;
+        .map_err(|error| format!("write IPC request: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("flush IPC request: {error}"))?;
     let response = read_bounded_line(&mut stream, 1024 * 1024, Duration::from_secs(5))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("read IPC response: {error}"))?;
     serde_json::from_str(response.trim_end()).map_err(|error| error.to_string())
 }
 
@@ -259,8 +263,9 @@ fn read_bounded_line(
     max_bytes: usize,
     timeout: Duration,
 ) -> io::Result<String> {
-    stream.set_nonblocking(true)?;
-    let result = read_bounded_line_nonblocking(stream, max_bytes, timeout);
+    let deadline = Instant::now() + timeout;
+    set_nonblocking_for_bounded_read(stream, deadline)?;
+    let result = read_bounded_line_nonblocking(stream, max_bytes, deadline);
     let restore_result = stream.set_nonblocking(false);
     match (result, restore_result) {
         (Ok(line), Ok(())) => Ok(line),
@@ -269,12 +274,27 @@ fn read_bounded_line(
     }
 }
 
+fn set_nonblocking_for_bounded_read(stream: &Stream, deadline: Instant) -> io::Result<()> {
+    loop {
+        match stream.set_nonblocking(true) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_windows_pipe_mode_pending(&error) => {
+                // A Windows client can connect to a listening named-pipe
+                // instance before the server thread accepts it. During that
+                // short interval SetNamedPipeHandleState(PIPE_NOWAIT) returns
+                // ERROR_PIPE_BUSY even though the connection is valid.
+                wait_for_ipc_data(deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn read_bounded_line_nonblocking(
     stream: &mut Stream,
     max_bytes: usize,
-    timeout: Duration,
+    deadline: Instant,
 ) -> io::Result<String> {
-    let deadline = Instant::now() + timeout;
     let mut bytes = Vec::with_capacity(512.min(max_bytes));
     let mut buffer = [0_u8; 1024];
     loop {
@@ -282,11 +302,11 @@ fn read_bounded_line_nonblocking(
             Ok(0) => {
                 #[cfg(windows)]
                 {
-                    // Windows PIPE_NOWAIT reports a temporarily empty byte
-                    // pipe as a successful zero-byte read. The peer can still
-                    // be connected and about to write, so wait until the hard
-                    // deadline instead of misclassifying this as EOF.
-                    wait_for_ipc_data(deadline)?;
+                    // interprocess maps both an empty PIPE_NOWAIT byte pipe
+                    // and a disconnected byte pipe to Ok(0). PeekNamedPipe
+                    // distinguishes a connected empty pipe from EOF before
+                    // the bounded poll waits again.
+                    wait_for_windows_pipe_data(stream, deadline)?;
                     continue;
                 }
                 #[cfg(not(windows))]
@@ -314,12 +334,66 @@ fn read_bounded_line_nonblocking(
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || is_windows_pipe_read_empty(&error) =>
+            {
                 wait_for_ipc_data(deadline)?;
             }
             Err(error) => return Err(error),
         }
     }
+}
+
+fn is_windows_pipe_mode_pending(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        // ERROR_PIPE_BUSY. A named-pipe client can connect and write before
+        // the server thread accepts the instance. Enabling PIPE_NOWAIT during
+        // that interval returns 231, so retry within the shared hard deadline.
+        error.raw_os_error() == Some(231)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn is_windows_pipe_read_empty(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        // ERROR_NO_DATA. In PIPE_NOWAIT mode this is the documented result for
+        // an empty pipe whose peer is still connected; it is not EOF.
+        error.raw_os_error() == Some(232)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_windows_pipe_data(stream: &Stream, deadline: Instant) -> io::Result<()> {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let Stream::NamedPipe(pipe) = stream;
+    let result = unsafe {
+        PeekNamedPipe(
+            pipe.as_handle().as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    wait_for_ipc_data(deadline)
 }
 
 fn wait_for_ipc_data(deadline: Instant) -> io::Result<()> {
@@ -649,6 +723,163 @@ mod tests {
             .expect("server thread")
             .expect("server should wait for the delayed request");
         assert_eq!(received, "{\"method\":\"ping\"}\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_client_waits_for_delayed_response_bytes() {
+        let endpoint = unique_test_endpoint("delayed-client-response");
+        let listener = endpoint.create_listener().expect("test pipe listener");
+        let (allow_accept_tx, allow_accept_rx) = mpsc::sync_channel(1);
+        let (request_read_tx, request_read_rx) = mpsc::sync_channel(1);
+        let (allow_response_tx, allow_response_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || -> io::Result<()> {
+            allow_accept_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("client should enter its response read");
+            let mut connection = listener
+                .incoming()
+                .next()
+                .expect("incoming stream")
+                .expect("accepted stream");
+            let request = read_bounded_line(&mut connection, 1024, Duration::from_millis(500))?;
+            assert_eq!(request, "{\"method\":\"summary\"}\n");
+            request_read_tx
+                .send(())
+                .expect("signal that the server read the request");
+            allow_response_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("client should allow the delayed response");
+            connection.write_all(b"{\"ok\":true}\n")?;
+            connection.flush()
+        });
+
+        let mut client = endpoint.connect().expect("test pipe client");
+        client
+            .write_all(b"{\"method\":\"summary\"}\n")
+            .expect("write request");
+        client.flush().expect("flush request");
+
+        let (reader_started_tx, reader_started_rx) = mpsc::sync_channel(0);
+        let (reader_result_tx, reader_result_rx) = mpsc::sync_channel(1);
+        let client_reader = thread::spawn(move || {
+            reader_started_tx
+                .send(())
+                .expect("signal before the delayed response read");
+            let result = read_bounded_line(&mut client, 1024, Duration::from_secs(1));
+            reader_result_tx
+                .send(result)
+                .expect("return the client read result");
+        });
+        reader_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("client reader should start");
+        // The client must remain inside the bounded read while the server has
+        // not accepted the already-connected pipe. The old implementation
+        // returned raw OS error 231 immediately in this exact state.
+        match reader_result_rx.recv_timeout(Duration::from_millis(150)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("client reader disconnected before server acceptance")
+            }
+            Ok(Ok(line)) => panic!("client read returned before server acceptance: {line:?}"),
+            Ok(Err(error)) => panic!(
+                "client read failed before server acceptance: raw_os_error={:?}: {error}",
+                error.raw_os_error()
+            ),
+        }
+        allow_accept_tx
+            .send(())
+            .expect("allow the server to accept and respond");
+        request_read_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should accept and read the request");
+        // Once accepted, an empty client-side PIPE_NOWAIT read reports
+        // ERROR_NO_DATA (232). That is also temporary until the same deadline.
+        match reader_result_rx.recv_timeout(Duration::from_millis(150)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("client reader disconnected before the delayed response")
+            }
+            Ok(Ok(line)) => panic!("client read returned before the response: {line:?}"),
+            Ok(Err(error)) => panic!(
+                "client read failed before the response: raw_os_error={:?}: {error}",
+                error.raw_os_error()
+            ),
+        }
+        allow_response_tx
+            .send(())
+            .expect("allow the server to send its response");
+
+        let response = reader_result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("client should finish after the server responds")
+            .expect("client should wait for the delayed response");
+        client_reader.join().expect("client reader thread");
+        server
+            .join()
+            .expect("server thread")
+            .expect("server should write the delayed response");
+        assert_eq!(response, "{\"ok\":true}\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_mode_and_empty_read_errors_are_classified_exactly() {
+        let pipe_busy = io::Error::from_raw_os_error(231);
+        let no_data = io::Error::from_raw_os_error(232);
+        let broken_pipe = io::Error::from_raw_os_error(109);
+
+        assert!(is_windows_pipe_mode_pending(&pipe_busy));
+        assert!(!is_windows_pipe_mode_pending(&no_data));
+        assert!(!is_windows_pipe_mode_pending(&broken_pipe));
+
+        assert!(is_windows_pipe_read_empty(&no_data));
+        assert!(!is_windows_pipe_read_empty(&pipe_busy));
+        assert!(!is_windows_pipe_read_empty(&broken_pipe));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_peer_close_does_not_wait_for_the_read_deadline() {
+        let endpoint = unique_test_endpoint("peer-close");
+        let listener = endpoint.create_listener().expect("test pipe listener");
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(0);
+        let (allow_close_tx, allow_close_rx) = mpsc::sync_channel(0);
+        let server = thread::spawn(move || {
+            let connection = listener
+                .incoming()
+                .next()
+                .expect("incoming stream")
+                .expect("accepted stream");
+            accepted_tx.send(()).expect("signal accepted stream");
+            allow_close_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("client should allow the peer close");
+            drop(connection);
+        });
+
+        let mut client = endpoint.connect().expect("test pipe client");
+        accepted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should accept the client");
+        // Set PIPE_NOWAIT while the peer is definitely connected, then close
+        // the peer before the read. interprocess maps the resulting 109/233
+        // to Ok(0), so this deterministically exercises the PeekNamedPipe path
+        // rather than failing earlier during the mode switch.
+        client
+            .set_nonblocking(true)
+            .expect("connected client should enter PIPE_NOWAIT");
+        allow_close_tx.send(()).expect("close the server peer");
+        server.join().expect("server thread");
+        let error = read_bounded_line_nonblocking(
+            &mut client,
+            1024,
+            Instant::now() + Duration::from_millis(100),
+        )
+        .expect_err("peer close cannot produce a complete line");
+        assert_ne!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(matches!(error.raw_os_error(), Some(109 | 233)));
     }
 
     #[cfg(windows)]

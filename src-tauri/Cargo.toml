@@ -1,6 +1,6 @@
 [package]
 name = "xiaoli"
-version = "0.1.0-beta.2"
+version = "0.1.0-beta.3"
 description = "XiaoLi: evidence-aware Codex model and token monitor"
 authors = ["XuYing1128"]
 edition = "2021"
@@ -54,6 +54,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+  "Win32_System_Pipes",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }

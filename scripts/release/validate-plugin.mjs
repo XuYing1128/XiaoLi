@@ -16,7 +16,7 @@ for (const path of required) {
 
 const manifest = JSON.parse(readFileSync(join(root, ".codex-plugin/plugin.json"), "utf8"));
 if (manifest.name !== "xiaoli-model-monitor") throw new Error("Unexpected plugin name");
-if (manifest.version !== "0.1.0-beta.2") throw new Error("Unexpected plugin version");
+if (manifest.version !== "0.1.0-beta.3") throw new Error("Unexpected plugin version");
 if (manifest.license !== "PolyForm-Noncommercial-1.0.0") {
   throw new Error("Unexpected plugin license");
 }
