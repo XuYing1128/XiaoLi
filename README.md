@@ -6,13 +6,15 @@
 
 <p align="center">一个小巧、可拖动、可缩放的 Codex 模型、Token、缓存与时序旁路监视器。</p>
 
-> 当前版本：`v0.1.0-beta.3`。这是独立社区项目，与 OpenAI 没有隶属关系，也不代表 OpenAI 官方背书。
+> 当前版本：`v0.1.0-beta.3`。这是独立社区项目，不能保证准确无误。
 
 [English](README.en.md) · [下载便携版](https://github.com/XuYing1128/XiaoLi/releases) · [状态与证据详解](docs/STATUS_AND_EVIDENCE.md) · [故障排查](docs/TROUBLESHOOTING.md)
 
 ## 小狸解决什么问题
 
 Codex 界面显示的是你选择的模型和思考档位，但开发者还会关心：本回合到底请求了什么、切换是否已生效、是否收到服务器重路由通知、消耗了多少 Token、缓存输入占比多少、响应是否明显偏离本机历史。
+
+特别是用着用着就触发风控了却不知道，导致白白浪费额度最后还给你拉了一坨大的。触发降智后可以快速发现，然后根据信息排查问题。
 
 小狸只读结构化 rollout、官方插件 hook 和本地派生缓存，把这些证据分开显示：
 
@@ -67,7 +69,7 @@ Codex 界面显示的是你选择的模型和思考档位，但开发者还会�
 
 1. 下载并解压 `XiaoLi-v0.1.0-beta.3-macOS-universal.app.zip`。
 2. 将 `XiaoLi.app` 移到“应用程序”，然后打开。
-3. 首个 beta 采用 ad-hoc 签名、未公证。如果 Gatekeeper 阻止启动，请在“系统设置 → 隐私与安全性”中核对应用后选择“仍要打开”。项目不会提供关闭 Gatekeeper 的脚本。
+3. 首个 beta 采用 ad-hoc 签名、未公证。如果 Gatekeeper 阻止启动，请在“系统设置 → 隐私与安全性”中核对应用后选择“仍要打开”。
 
 ### Linux x64
 
@@ -184,5 +186,3 @@ cargo test --manifest-path .\src-tauri\Cargo.toml --locked
 ## 许可证
 
 小狸以 [PolyForm Noncommercial 1.0.0](LICENSE) 提供，允许个人、学习、研究以及许可证列出的非商业组织用途，不授权商业用途。因为包含非商业限制，本项目应称为“源码公开 / source-available”，不是 OSI 定义下的开源软件。
-
-角色与图标还受 [素材来源与分发声明](ASSET_PROVENANCE.md) 约束。第三方依赖继续遵循各自许可证。
