@@ -180,7 +180,6 @@ cargo test --manifest-path .\src-tauri\Cargo.toml --locked
 - [故障排查](docs/TROUBLESHOOTING.md)
 - [变更记录](CHANGELOG.md)
 - [设计系统](DESIGN.md)
-- [第三方许可](THIRD_PARTY_NOTICES.md)
 
 ## 许可证
 
