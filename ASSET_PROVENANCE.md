@@ -2,7 +2,7 @@
 
 ## Scope
 
-This record covers the six reviewed image masters used by XiaoLi v0.1:
+This record covers the six reviewed image masters reused by XiaoLi v0.2.0-beta.1:
 
 - `src/assets/mochi-green.png`
 - `src/assets/mochi-yellow.png`
@@ -61,6 +61,6 @@ No character, game asset, screenshot, logo, or illustration from the open-source
 
 On 2026-08-25, the user and intended publisher explicitly confirmed that they hold the rights required to use the private visual reference for this redraw and to distribute the resulting XiaoLi character assets publicly under the project's noncommercial terms. This repository records that confirmation date without publishing the private source image or its local filename.
 
-The generated masters may therefore be included in the XiaoLi source repository and noncommercial release archives under the project's asset notice. The private reference itself remains excluded from source control, build artifacts, release archives, provenance bundles, screenshots used as source material, and installed application directories.
+The generated masters may therefore be included in the XiaoLi source repository and noncommercial release archives under the project's asset notice. XiaoLi v0.2.0-beta.1 reuses the reviewed masters without importing the private reference. The private reference itself remains excluded from source control, build artifacts, release archives, provenance bundles, screenshots used as source material, and installed application directories.
 
 Required Notice: XiaoLi character and icon assets © 2026 XuYing1128. Noncommercial redistribution is permitted only together with the project license and this provenance record.

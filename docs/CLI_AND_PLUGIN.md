@@ -1,6 +1,6 @@
 # CLI、插件与快照参考
 
-本文是 `xiaoli` 命令行、Codex 插件和 `MonitorSnapshotV4` 公共接口的参考。
+本文是 `xiaoli` 命令行、Codex 插件和 `MonitorSnapshotV5` 公共接口的参考。
 
 ## 生命周期命令
 
@@ -25,7 +25,7 @@ xiaoli --probe-once
   [--state-root PATH]
 ```
 
-探针进行一次只读采集并把 `MonitorSnapshotV4` JSON 写到标准输出。它不会写生产 SQLite、解析游标或 `monitor.jsonl`，适合 fixture、CI 和诊断。
+探针进行一次只读采集并把 `MonitorSnapshotV5` JSON 写到标准输出。它不会写生产 SQLite、解析游标或 `monitor.jsonl`，适合 fixture、CI 和诊断。
 
 参数：
 
@@ -43,7 +43,7 @@ Windows PowerShell 示例：
   --session-index .\fixtures\session_index.jsonl
 ```
 
-验证：输出必须能被 `ConvertFrom-Json` 读取，`schemaVersion` 为 `4`，且不含 prompt、回复正文或完整 cwd。
+验证：输出必须能被 `ConvertFrom-Json` 读取，`schemaVersion` 为 `5`，且不含 prompt、回复正文或完整 cwd。
 
 ## 无 Node 插件命令
 
@@ -78,11 +78,19 @@ Windows PowerShell 示例：
 
 ### `get_session_detail(threadId)`
 
-返回指定根任务及其子会话/子智能体的完整 V4 证据。找不到线程时返回结构化错误，不猜测最接近的 ID。
+返回指定根任务及其子会话/子智能体的完整 V5 证据。找不到线程时返回结构化错误，不猜测最接近的 ID。
 
 ### `render_monitor_card(threadId?, theme?)`
 
 返回适合 Codex 对话内展示的监视卡数据。`theme` 接受 `cute` 或 `minimal`；不提供 `threadId` 时返回所有活动根任务摘要。
+
+### `get_connection_origin(threadId)`
+
+`threadId` 必填。只读返回该活动线程的 provider、endpoint 分类、认证模式、置信度和限制。不返回完整 URL、环境变量值、OAuth token 或 API Key；找不到线程时返回结构化错误，不任意选择另一个会话。
+
+### `list_relay_audits(limit?)` / `get_relay_audit(auditId)`
+
+只读列出已有脱敏审计报告或查看单份报告。MCP 不提供启动/取消审计、保存凭据或修改 endpoint 的工具，避免在对话内隐式消耗额度。
 
 ## 插件目录
 
@@ -106,11 +114,11 @@ xiaoli-model-monitor/
 
 实际端点写入状态目录的 `ipc-endpoint.json`。Unix 单实例使用独占文件锁，Windows 使用命名互斥量。
 
-## `MonitorSnapshotV4`
+## `MonitorSnapshotV5`
 
-字段定义和准确性限制见 [状态与证据](STATUS_AND_EVIDENCE.md#monitorsnapshotv4-核心结构)。兼容性规则：
+字段定义和准确性限制见 [状态与证据](STATUS_AND_EVIDENCE.md#monitorsnapshotv5-核心结构)。兼容性规则：
 
-- V4 保留 V3 的核心字段。
+- V5 完整保留 V4 字段，并在每个会话增加 `connectionOrigin`。
 - `timing.observedOutputRate` 映射到端到端观测速率。
 - `anomalies` 继续输出简短兼容文案；详细统计位于 `qualityAssessment`。
 - `serverRoute.evidence` 只接受 `notObserved` 或 `explicitReroute`。
@@ -124,7 +132,7 @@ Tauri 内部命令 `refresh_now` 是异步命令，返回：
 ```json
 {
   "status": "completed",
-  "snapshot": { "schemaVersion": 4 }
+  "snapshot": { "schemaVersion": 5 }
 }
 ```
 

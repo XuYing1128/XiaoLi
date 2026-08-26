@@ -11,11 +11,15 @@
 
 ## 第一步：解压并启动
 
-Windows 解压 ZIP 后运行 `XiaoLi.exe`。macOS 解压 `.app.zip` 后将应用移到“应用程序”。Linux 解压后运行 AppImage；如果来自 ZIP，先执行：
+Windows ZIP 自带顶级 `XiaoLi` 文件夹：把它解压到父目录（例如 `D:\Apps`），再运行 `D:\Apps\XiaoLi\XiaoLi.exe`。macOS 解压 `.app.zip` 后将应用移到“应用程序”。Linux 压缩包同样自带顶级 `XiaoLi` 文件夹；解压后先进入该目录：
 
 ```bash
+cd XiaoLi
 chmod +x XiaoLi-x86_64.AppImage
+./XiaoLi-x86_64.AppImage
 ```
+
+普通启动因缺少 FUSE 失败时，可改用 `./XiaoLi-x86_64.AppImage --appimage-extract-and-run`。这只是 AppImage 的解包运行后备方式，不会关闭系统安全机制。
 
 首次启动会为当前用户写入或升级 `xiaoli-model-monitor` 插件配置。随后在 Codex 中打开 `/hooks`，审阅并信任小狸的本地 hook；小狸不会绕过 Codex 的信任确认。程序移动到其他目录后，再启动一次即可修复绝对路径，但命令哈希变化后也需要重新审阅。若 Codex 已经运行，请新建任务或重启后加载插件。
 
@@ -77,5 +81,7 @@ chmod +x XiaoLi-x86_64.AppImage
 ## 下一步
 
 - 阅读 [状态与证据](STATUS_AND_EVIDENCE.md)，理解为什么请求模型、显式 reroute 和行为判断必须分开。
+- 从托盘打开 [小狸工作台](WORKBENCH.md)，查看来源分类、会话历史和四条审计证据轴。
+- 只在你有权测试 endpoint、已准备独立 API Key 并愿意承担预算时，再阅读 [中转审计方法](RELAY_AUDIT.md) 并手动开始检测。
 - 阅读 [CLI 与插件](CLI_AND_PLUGIN.md)，从命令行执行无副作用探针或在 Codex 对话中调用只读卡片。
 - 阅读 [隐私说明](PRIVACY.md)，了解本地文件和不采集内容。

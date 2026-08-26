@@ -1,23 +1,38 @@
 # 状态、模型证据与疑似降质
 
-本文解释小狸如何从结构化事件得到每个状态，以及哪些结论不能从当前公开接口得到。若界面与本文冲突，以本文的证据边界和 `MonitorSnapshotV4` 数据为准。
+本文解释小狸如何从结构化事件得到每个状态，以及哪些结论不能从当前公开接口得到。若界面与本文冲突，以本文的证据边界和 `MonitorSnapshotV5` 数据为准。
 
-## 四条独立证据线
+## Codex 监视的五条独立证据线
 
 ```text
 hook / turn_context ──> activeRequest ──> 本回合请求模型与请求 effort
 线程设置变化 ────────> pendingNextTurn ──> 下一回合待生效
 model/rerouted ──────> serverRoute ─────> 明确服务器重路由链
+provider + endpoint + auth mode ─> connectionOrigin ─> 经脱敏的配置来源分类
 
 token + item timing + 本地历史 ─────────> qualityAssessment（只允许黄色统计提醒）
 ```
 
-这四条线不会相互冒充。尤其是：
+这五条线不会相互冒充。尤其是：
 
 - 请求模型不是服务器物理模型的独立回执。
 - `pendingNextTurn` 不会改写已经启动的回合。
 - 没有显式 reroute 只表示没有观察到事件。
 - 行为特征永远不会创建 `serverRoute`。
+- `connectionOrigin` 只证明配置的 provider/endpoint/认证证据如何分类，不证明该端点后面是什么物理模型。
+
+## 中转审计的四条证据轴
+
+| 证据轴 | 绿 | 黄 | 红 | 灰 |
+| --- | --- | --- | --- | --- |
+| 协议兼容 | 本次协议范围正常 | —（当前没有独立黄色协议状态） | 可复现契约矛盾 | 无法检查 |
+| 计量一致性 | usage 自洽；有实时官方配对时还可与参考一致 | 多量级疑似过量计数 | usage 算术不可能 | usage 缺失或对应比较无法执行 |
+| 行为质量 | 标准/深度实时官方配对下与参考一致 | 实时配对下至少两个已实现能力域持续降低 | —（行为统计不会产生红色身份结论） | 快速档/未配对时学习中，或任务不可比/参考不足 |
+| 模型身份 | 仅在同次实时官方配对下与参考行为一致 | 配对分布显著不同 | —（错误自报型号由协议轴判红） | 只有 API 自报型号，未获行为参考或物理身份证明 |
+
+每个证据轴独立着色：未启用实时官方配对时，协议与 usage 算术自洽仍可为绿色；目标端确定性探针虽会采集，但相对行为质量保持灰色学习中/证据不足，模型身份轴也必须是灰色 `insufficientEvidence`。快速档即使启用官方配对，质量样本仍低于裁决门槛，因此质量轴保持学习中；标准/深度档才执行当前质量比较。Release 内置社区参考只能附加低置信、跨协议的实验性相对排名，不会把任何证据轴变绿/变红，也不改变总裁决。任何绿色都只说明该轴在本次范围内未见异常，不能把协议成功、导入摘要或社区排名伪装成身份验证。方法详见 [中转审计](RELAY_AUDIT.md)。
+
+`v0.2.0-beta.1` 的中转质量探针覆盖结构化 JSON、长上下文随机 nonce 检索、算术/约束推理、多语言、工具选择和状态保持六个域。工具域向三种协议发送真实工具 schema，但只在本地解析并评分受限的结构化函数名/字符串参数，绝不执行调用、URL 或代码，也不持久化原始响应正文。状态保持只验证同一请求所携带的 `system / user / assistant / user` 消息历史，不是跨网络会话或物理模型证明。导入的 `RelayBaselineSummary` 只作元数据显示；Release 内置社区分布只作低置信实验排名；只有本次审计实时调用的、同协议同精确模型官方 profile 会参与中/高置信度配对统计。
 
 ## 所有界面状态
 
@@ -93,7 +108,7 @@ MAD 是“中位绝对偏差”，用于描述本机历史分布的典型波动�
 
 Codex 没有运行，或当前没有活动回合。完成记录不会保留在主列表中；合格终态样本只进入本地行为基线。
 
-### 刷新中、已合并、刷新超时与刷新失败 `⟳`
+### 刷新中、已合并、刷新超时与刷新失败 `↻`
 
 这四个是交互提示，不是模型证据或采集器主状态：
 
@@ -111,6 +126,8 @@ Sol（请求） → 5.5（服务器已重路由）
 ```
 
 多次 reroute 会保留有序链。Tooltip 提供事件时间与经过脱敏的关联方式；兼容日志不保存原始原因正文。
+
+如果明确 reroute 事件缺少可显示的目标模型，界面显示黄色“已重路由，目标未知”。这仍然确认发生过明确 route 事件，但小狸不会根据请求模型、速度或文本特征补猜目标。
 
 ### 未见服务器重路由，灰色 `◇`
 
@@ -159,6 +176,21 @@ Sol（请求） → 5.5（服务器已重路由）
 
 等待态不会显示伪造的 `0`，也不会单独把任务判为异常。
 
+## 中转审计总裁决状态
+
+`overallVerdict` 只汇总四条证据轴和运行生命周期，不会生成“真实模型概率”：
+
+| 总裁决 | 显示级别 | 固定含义 |
+| --- | --- | --- |
+| `consistent` | 绿 | 本次参数、样本和实时匹配参考的适用范围内未见显著异常；物理模型未获证明 |
+| `suspectedPadding` | 黄 | 至少两个受控输入量级的计量偏差越过配对参考与容差；不是服务商主观故意的证明 |
+| `suspectedDegradation` | 黄 | 实时配对下至少两个已实现能力域持续低于参考；不是已换成某命名模型的证明 |
+| `significantlyDifferent` | 黄 | 配对行为分布越过当前 JSD/MMD 门槛；不填充 `actualModel` |
+| `confirmedContractMismatch` | 红 | 协议或 usage 存在可复现的明确契约矛盾；不自动推导后端实体 |
+| `insufficientEvidence` | 灰 | 样本、实时参考或可控参数不足；灰色不是通过 |
+| `failed` | 红 | 没有成功的可解析响应，或审计发生确定性失败；没有形成模型结论 |
+| `cancelled` | 灰 | 用户取消，之后不再启动新请求；已完成结构化证据可保留，但整次运行不作通过结论 |
+
 ## 可选的 5.5 行为比较
 
 只有本机同时拥有不少于 30 个明确“请求 gpt-5.5”的同桶健康样本，并且至少三个共同指标可比较时，才会计算对照距离。如果到 5.5 基线的稳健距离比到当前请求模型基线至少低 30%，界面可以追加：
@@ -188,11 +220,11 @@ Sol（请求） → 5.5（服务器已重路由）
 
 采集器只读取 `item_completed` 的 item 类型、ID 和结构化时间，不读取或保存推理、回复、命令和工具正文。
 
-## `MonitorSnapshotV4` 核心结构
+## `MonitorSnapshotV5` 核心结构
 
 ```text
-MonitorSnapshotV4
-  schemaVersion = 4
+MonitorSnapshotV5
+  schemaVersion = 5
   checkedAt
   codexRunning
   collectorHealth
@@ -213,6 +245,9 @@ MonitorSnapshotV4
     qualityAssessment
       state / baselineKey / baselineSampleCount / consecutiveHits
       factors[] / comparator? / limitations[]
+    connectionOrigin
+      kind / authMode / confidence / providerId? / endpointClass
+      evidence[] / limitations[]
     status { level, code, explanation }
     anomalies[]                     # 简短兼容文案
 ```
@@ -229,4 +264,6 @@ MonitorSnapshotV4
 - [快速开始](GETTING_STARTED.md)
 - [CLI 与插件参考](CLI_AND_PLUGIN.md)
 - [隐私说明](PRIVACY.md)
+- [工作台指南](WORKBENCH.md)
+- [中转审计方法](RELAY_AUDIT.md)
 - [故障排查](TROUBLESHOOTING.md)

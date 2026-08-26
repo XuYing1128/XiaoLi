@@ -18,7 +18,7 @@
 4. 执行 `xiaoli --install-plugin` 修复插件中的可执行文件绝对路径。
 5. 检查状态说明是否出现“父会话未找到 / 层级异常”。小狸会保留孤立子任务，不会静默丢弃。
 
-如果你从旧版本升级，V4 会使旧 EOF 解析游标失效并重放原始 rollout；首次重建可能短暂显示学习中。
+如果你从旧版本升级，V5 / 解析缓存格式 10 会重放 rollout 首部以恢复 `session_meta.model_provider`；首次重建可能短暂显示学习中或来源待确认。
 
 ## 模型切换没有出现
 
@@ -30,7 +30,7 @@
 2. 在 Codex `/hooks` 中审阅并信任 `xiaoli-model-monitor`；安装配置不会自动绕过 hook 信任确认。
 3. 退出并重新启动 Codex，或开始一个新任务，使新 hook 配置加载。
 4. 确认 hook 和 rollout 两条请求证据都能到达。
-4. 用 `get_session_detail(threadId)` 检查 `activeRequest.source` 和 `pendingNextTurn`。
+5. 用 `get_session_detail(threadId)` 检查 `activeRequest.source` 和 `pendingNextTurn`。
 
 ## 一直显示“未见服务器重路由”
 
@@ -73,9 +73,47 @@
 - 拔出显示器或修改 DPI 后，重新显示窗口会将其钳制到可见工作区。
 - Wayland 的绝对定位和置顶取决于 compositor；可尝试 X11 会话确认差异。
 
+## 连接来源一直是“未知”
+
+`connectionOrigin` 不使用速度或回答风格猜测。以下情况会返回未知：
+
+- 旧会话的 `session_meta.model_provider` 尚未完成缓存格式 10 回放。
+- provider/base URL、hook endpoint 分类和环境/CLI 临时覆盖互相冲突。
+- 第一方 endpoint 存在，但 `auth_mode` 不匹配或缺失。
+- provider 配置使用小狸未识别的托管或本地命名。
+
+先等待一次完整后台刷新，再展开工作台来源的 `evidence` 和 `limitations`。不要为了得到“官方”标签而删除冲突证据；未知是比误判更可靠的结论。
+
+## 中转审计一直是“证据不足”
+
+这通常是正确行为：
+
+- 只运行了连接测试。
+- 没有在本次审计中配置并实时调用同协议、同精确模型的第一方配对端点。
+- 某些 fingerprint cell 有效回答少于 10，或目标/官方配对的可比质量 case 不足。
+- 预算、超时、限流、取消或协议不支持使测试提前结束。
+- 只导入了用户/社区参考摘要。当前 beta 的导入摘要仅作元数据显示，不参与 scorer，不能消除模型身份轴的证据不足。Release 内置社区分布即使给出“实验性地更接近”排名，也只是跨协议低置信附加证据，不会让身份轴变绿。
+- 使用快速档查看行为质量。快速档只采集少量质量样本，不满足裁决门槛；即使有实时官方配对，质量轴也保持学习中。使用标准或深度档才会执行当前质量比较。
+
+灰色不是“检测通过”。展开报告的四条证据轴查看缺少的实时参考或样本。未配对时协议和 usage 自洽检查仍可能有结果，但不能通过放宽门槛或导入摘要强制让模型身份变绿。
+
+## 系统凭据库无法保存 API Key
+
+小狸不会回退到明文文件。保存失败后，Key 仍只在当前进程内存：
+
+- Windows：检查 Credential Manager 是否被组织策略禁用。
+- macOS：查看 Keychain 是否锁定。
+- Linux：确认当前桌面会话有可用的 Secret Service/DBus。
+
+如果不想修复凭据库，可保持“只在内存”并在每次启动后手动输入。但内存 Key 不能用于跨重启定时审计。
+
+## 中转审计取消后短暂仍显示运行中
+
+取消标志会立即阻止开始下一个请求。正在系统网络栈内等待的单个请求需要等待取消或超时返回，因此 UI 可能短暂保留运行状态。使用有界 `timeoutMs`，并在报告中确认结论为 `cancelled`。
+
 ## Windows SmartScreen 或 macOS Gatekeeper 警告
 
-`v0.1.0-beta.3` 没有正式代码签名或公证。ZIP 不会绕过平台保护。
+`v0.2.0-beta.1` 没有正式代码签名或公证。ZIP 不会绕过平台保护。
 
 1. 从项目 GitHub Release 下载。
 2. 对照 `SHA256SUMS.txt`。
