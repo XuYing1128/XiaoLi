@@ -16,6 +16,7 @@ src-tauri/target*/
 target/
 
 # Local collector state and production/shadow probes
+.gstack/
 edge-profile-test/
 race-state/
 shadow-state/

@@ -1981,10 +1981,16 @@ fn sanitize_label(value: &str, max_chars: usize) -> String {
 }
 
 fn classify_io_error(error: std::io::Error) -> RelayTransportError {
-    if matches!(
-        error.kind(),
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-    ) {
+    let reqwest_timeout = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<reqwest::Error>())
+        .is_some_and(reqwest::Error::is_timeout);
+    if reqwest_timeout
+        || matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        )
+    {
         RelayTransportError::Timeout
     } else {
         RelayTransportError::Network
@@ -2095,6 +2101,24 @@ mod tests {
             stream.flush().ok();
         });
         (format!("http://{address}"), receiver)
+    }
+
+    fn spawn_scripted_response_server<F>(
+        handler: F,
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>)
+    where
+        F: FnOnce(&mut TcpStream) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind scripted mock server");
+        let address = listener.local_addr().expect("scripted mock address");
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept scripted mock request");
+            let request = read_http_request(&mut stream);
+            sender.send(request).ok();
+            handler(&mut stream);
+        });
+        (format!("http://{address}"), receiver, server)
     }
 
     fn read_http_request(stream: &mut TcpStream) -> String {
@@ -2589,6 +2613,238 @@ mod tests {
             error,
             RelayTransportError::ResponseTooLarge { limit_bytes: 1024 }
         );
+    }
+
+    #[test]
+    fn socket_reassembles_fragmented_responses_sse_across_headers_events_and_utf8() {
+        let events = [
+            json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "object": "response",
+                    "model": "gpt-test",
+                    "output": []
+                }
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "delta": "蓝"
+            }),
+            json!({
+                "type": "response.completed",
+                "sequence_number": 2,
+                "response": {
+                    "object": "response",
+                    "model": "gpt-test",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 3,
+                        "output_tokens": 1,
+                        "total_tokens": 4
+                    }
+                }
+            }),
+        ];
+        let response = sse_response(&events);
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("response headers");
+        let utf8_start = response
+            .windows("蓝".len())
+            .position(|window| window == "蓝".as_bytes())
+            .expect("UTF-8 probe answer");
+        let mut split_points = vec![
+            1,
+            header_end.saturating_sub(1),
+            header_end + 1,
+            utf8_start + 1,
+            utf8_start + 2,
+            response.len().saturating_sub(1),
+            response.len(),
+        ];
+        split_points.sort_unstable();
+        split_points.dedup();
+
+        let (base_url, _, server) = spawn_scripted_response_server(move |stream| {
+            let mut start = 0usize;
+            for end in split_points {
+                if end <= start || end > response.len() {
+                    continue;
+                }
+                stream
+                    .write_all(&response[start..end])
+                    .expect("write fragmented SSE response");
+                stream.flush().expect("flush fragmented SSE response");
+                start = end;
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let mut relay_request = request(base_url, RelayProtocol::OpenAiResponses);
+        relay_request.stream = true;
+
+        let result = RelayTransport::with_default_limits()
+            .expect("transport")
+            .execute(&relay_request, &AtomicBool::new(false))
+            .expect("fragmented SSE response");
+        server.join().expect("fragmented SSE server");
+
+        assert!(result.observed_streaming);
+        assert_eq!(result.metadata.stream_terminated, Some(true));
+        assert_eq!(result.normalized_answer.as_deref(), Some("蓝"));
+        assert_eq!(result.usage.and_then(|usage| usage.total_tokens), Some(4));
+    }
+
+    #[test]
+    fn socket_marks_anthropic_stream_closed_before_terminal_as_abnormal() {
+        let events = [
+            json!({
+                "type": "message_start",
+                "message": {
+                    "type": "message",
+                    "model": "gpt-test",
+                    "usage": {"input_tokens": 2, "output_tokens": 0}
+                }
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "blue"}
+            }),
+        ];
+        let body = events
+            .iter()
+            .map(|event| {
+                let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+                format!("event: {kind}\ndata: {event}\n\n")
+            })
+            .collect::<String>();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        )
+        .into_bytes();
+        let (base_url, _, server) = spawn_scripted_response_server(move |stream| {
+            stream
+                .write_all(&response)
+                .expect("write prematurely closed Anthropic stream");
+            stream
+                .flush()
+                .expect("flush prematurely closed Anthropic stream");
+        });
+        let mut relay_request = request(base_url, RelayProtocol::AnthropicMessages);
+        relay_request.stream = true;
+
+        let result = RelayTransport::with_default_limits()
+            .expect("transport")
+            .execute(&relay_request, &AtomicBool::new(false))
+            .expect("bounded incomplete stream remains inspectable");
+        server.join().expect("incomplete Anthropic stream server");
+
+        assert_eq!(result.metadata.stream_terminated, Some(false));
+        let assessment = crate::relay_audit::score_protocol_metadata(&result.metadata);
+        assert_eq!(
+            assessment.state,
+            crate::relay_audit::ProtocolAssessmentKind::Abnormal
+        );
+        assert!(assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("valid terminal event")));
+    }
+
+    #[test]
+    fn socket_maps_chat_429_to_rate_limited_without_reading_error_body() {
+        let response = b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n".to_vec();
+        let (base_url, _, server) = spawn_scripted_response_server(move |stream| {
+            stream
+                .write_all(&response)
+                .expect("write rate-limit response headers");
+            stream.flush().expect("flush rate-limit response headers");
+        });
+        let error = RelayTransport::with_default_limits()
+            .expect("transport")
+            .execute(
+                &request(base_url, RelayProtocol::OpenAiChatCompletions),
+                &AtomicBool::new(false),
+            )
+            .expect_err("HTTP 429 must fail");
+        server.join().expect("rate-limit server");
+
+        assert_eq!(error, RelayTransportError::HttpStatus { status: 429 });
+        assert_eq!(
+            map_transport_failure(error),
+            crate::audit_manager::TransportFailure {
+                kind: crate::audit_manager::TransportFailureKind::RateLimited,
+                http_status: Some(429),
+            }
+        );
+    }
+
+    #[test]
+    fn socket_rejects_close_delimited_body_when_later_chunk_crosses_limit() {
+        let headers =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+        let first_body_chunk = vec![b' '; 48];
+        let second_body_chunk = vec![b' '; 32];
+        let (base_url, _, server) = spawn_scripted_response_server(move |stream| {
+            stream.write_all(headers).expect("write response headers");
+            stream
+                .write_all(&first_body_chunk)
+                .expect("write first body chunk");
+            stream.flush().expect("flush first body chunk");
+            thread::sleep(Duration::from_millis(30));
+            let _ = stream.write_all(&second_body_chunk);
+            let _ = stream.flush();
+        });
+        let transport = RelayTransport::new(RelayTransportLimits {
+            max_response_bytes: 64,
+            max_sse_event_bytes: 32,
+        })
+        .expect("transport");
+
+        let error = transport
+            .execute(
+                &request(base_url, RelayProtocol::OpenAiResponses),
+                &AtomicBool::new(false),
+            )
+            .expect_err("aggregate body limit must apply without Content-Length");
+        server.join().expect("chunked body server");
+
+        assert_eq!(
+            error,
+            RelayTransportError::ResponseTooLarge { limit_bytes: 64 }
+        );
+    }
+
+    #[test]
+    fn socket_read_timeout_is_reported_as_timeout() {
+        let (base_url, _, server) = spawn_scripted_response_server(move |stream| {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{",
+                )
+                .expect("write partial response");
+            stream.flush().expect("flush partial response");
+            thread::sleep(Duration::from_millis(400));
+        });
+        let mut relay_request = request(base_url, RelayProtocol::AnthropicMessages);
+        relay_request.timeout_ms = 100;
+
+        let error = RelayTransport::with_default_limits()
+            .expect("transport")
+            .execute(&relay_request, &AtomicBool::new(false))
+            .expect_err("stalled body read must time out");
+        server.join().expect("timeout server");
+
+        assert_eq!(error, RelayTransportError::Timeout);
     }
 
     #[test]

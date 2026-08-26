@@ -1553,6 +1553,10 @@ function statusChip(level: StatusLevel, label: string, tooltip?: string): HTMLSp
 }
 
 function renderHistory(): void {
+  const focusKey = (document.activeElement as HTMLElement | null)?.dataset.focusKey;
+  const scrollContainer = mount.querySelector<HTMLElement>(".history-table-wrap");
+  const scrollTop = scrollContainer?.scrollTop;
+  const scrollLeft = scrollContainer?.scrollLeft;
   const body = mount.querySelector<HTMLTableSectionElement>(".history-body");
   if (body) body.replaceChildren(...state.history.map(historyRow));
   setVisible(mount.querySelector(".history-table-wrap"), state.history.length > 0);
@@ -1560,6 +1564,15 @@ function renderHistory(): void {
   setText(".history-count", `共 ${state.historyTotal || state.history.length} 条·只读指标`);
   const more = mount.querySelector<HTMLButtonElement>('[data-action="history-more"]');
   if (more) more.hidden = state.history.length === 0 || state.history.length >= state.historyTotal;
+  if (scrollContainer && scrollTop !== undefined && scrollLeft !== undefined) {
+    scrollContainer.scrollTop = scrollTop;
+    scrollContainer.scrollLeft = scrollLeft;
+  }
+  if (focusKey) {
+    Array.from(mount.querySelectorAll<HTMLElement>("[data-focus-key]"))
+      .find((element) => element.dataset.focusKey === focusKey)
+      ?.focus({ preventScroll: true });
+  }
 }
 
 function historyRow(item: HistoryEntry): HTMLTableRowElement {
@@ -2382,8 +2395,8 @@ async function startAudit(): Promise<void> {
     };
     const preview = await previewAuditPlan(mode, profile, request);
     if (!preview) return;
-    if (!preview.fitsDeclaredBudget) {
-      const overages = auditPlanOverages(preview, budget);
+    const overages = auditPlanOverages(preview, budget);
+    if (!preview.fitsDeclaredBudget || overages) {
       showNotice(
         `完整计划超出已确认预算（${overages || "预算不足"}；内置 ${preview.builtInRequests} + 私有题包 ${preview.privateProbeRequests}）；请减少题包任务或调整检测档位`,
         "yellow",

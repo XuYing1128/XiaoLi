@@ -127,6 +127,7 @@ jobs:
       - name: Type-check and build frontend
         run: |
           pnpm check
+          pnpm test
           pnpm build
       - name: Format-check Rust
         working-directory: src-tauri

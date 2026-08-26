@@ -93,6 +93,9 @@ jobs:
       - name: Type-check frontend
         run: pnpm check
 
+      - name: Test frontend behavior
+        run: pnpm test
+
       - name: Build frontend
         run: pnpm build
 
