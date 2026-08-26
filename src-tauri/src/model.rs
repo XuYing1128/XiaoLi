@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
+use crate::connection::{ConnectionOriginSnapshot, EndpointClass};
+
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
 // Increment when parser semantics change in a way that can leave a previously
 // rejected physical rollout parked at EOF. Version 7 re-evaluates paginated
 // history bases that may legitimately point at an ancestor thread.
@@ -10,7 +12,9 @@ pub const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 // Version 9 replaces serialized runtime FileState values with an
 // absolute-path-free, content-free state whose cursor stops at the last
 // complete line.
-pub const COLLECTOR_CACHE_FORMAT_VERSION: u32 = 9;
+// Version 10 replays rollout headers so session_meta.model_provider can be
+// recovered even when a previous parser left the file parked at EOF.
+pub const COLLECTOR_CACHE_FORMAT_VERSION: u32 = 10;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,6 +108,10 @@ impl Default for ServerRouteSnapshot {
 pub struct UsageSnapshot {
     pub last: TokenUsage,
     pub cumulative: TokenUsage,
+    /// Internal turn-local delta used when writing per-turn history. It is
+    /// deliberately excluded from the public snapshot and all persisted JSON.
+    #[serde(skip)]
+    pub turn: TokenUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_cache_input_share: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -263,6 +271,10 @@ pub struct ConversationSnapshot {
     pub timing: TimingSnapshot,
     #[serde(default)]
     pub quality_assessment: QualityAssessment,
+    /// Configured connection-origin evidence. This is deliberately separate
+    /// from request settings, explicit server reroutes and behavior telemetry.
+    #[serde(default)]
+    pub connection_origin: ConnectionOriginSnapshot,
     #[serde(default)]
     pub tool_activity: bool,
     pub status: StatusSnapshot,
@@ -289,6 +301,26 @@ pub struct MonitorSnapshot {
     pub collector_health: CollectorHealth,
     #[serde(default)]
     pub conversations: Vec<ConversationSnapshot>,
+}
+
+impl MonitorSnapshot {
+    /// Returns the metadata-only snapshot allowed to cross the persistence
+    /// boundary. Prompt-derived session titles remain available to the live UI
+    /// but are replaced with a time and short-thread label on disk.
+    pub fn redacted_for_persistence(&self) -> Self {
+        let mut redacted = self.clone();
+        for conversation in &mut redacted.conversations {
+            conversation.title =
+                persistence_display_label(&self.checked_at, &conversation.thread_id);
+        }
+        redacted
+    }
+}
+
+pub fn persistence_display_label(checked_at: &str, thread_id: &str) -> String {
+    let time = checked_at.chars().take(16).collect::<String>();
+    let short_thread = thread_id.chars().take(8).collect::<String>();
+    format!("{time} · {short_thread}")
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -421,6 +453,8 @@ pub struct FileState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
     #[serde(default)]
     pub kind: ThreadKind,
@@ -474,6 +508,7 @@ impl FileState {
             identity_known: false,
             identity_rejected: false,
             thread_id: None,
+            model_provider: None,
             parent_thread_id: None,
             kind: ThreadKind::Root,
             agent_path: None,
@@ -540,6 +575,8 @@ pub struct PersistedFileState {
     pub cursor: PersistedFileCursor,
     pub thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
     #[serde(default)]
     pub kind: ThreadKind,
@@ -599,6 +636,7 @@ impl PersistedFileState {
                 anchor_hash: state.durable_anchor_hash,
             },
             thread_id,
+            model_provider: state.model_provider.clone(),
             parent_thread_id: state.parent_thread_id.clone(),
             kind: state.kind,
             agent_nickname: state.agent_nickname.clone(),
@@ -638,6 +676,7 @@ impl PersistedFileState {
             identity_known: true,
             identity_rejected: false,
             thread_id: Some(self.thread_id),
+            model_provider: self.model_provider,
             parent_thread_id: self.parent_thread_id,
             kind: self.kind,
             agent_path: None,
@@ -670,6 +709,13 @@ pub struct HookObservation {
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_class: Option<EndpointClass>,
+    /// Short one-way endpoint-scope digest covering scheme, host, effective
+    /// port, and normalized base path. It is never copied into public snapshots
+    /// or conversation history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_host_hash: Option<String>,
     pub observed_at: String,
 }
 
@@ -799,7 +845,7 @@ mod tests {
             conversations: Vec::new(),
         };
         let value = serde_json::to_value(snapshot).expect("serialize snapshot");
-        assert_eq!(value["schemaVersion"], 4);
+        assert_eq!(value["schemaVersion"], 5);
         assert_eq!(value["codexRunning"], false);
         assert!(value.get("schema_version").is_none());
     }

@@ -9,7 +9,7 @@ on:
       tag:
         description: Existing v-prefixed tag to package
         required: true
-        default: v0.1.0-beta.3
+        default: v0.2.0-beta.1
 
 permissions:
   contents: read
@@ -22,19 +22,23 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  XIAOLI_VERSION: 0.1.0-beta.3
+  XIAOLI_VERSION: 0.2.0-beta.1
 
 jobs:
   validate-ref:
     name: Validate release ref
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     outputs:
       tag: ${{ steps.ref.outputs.tag }}
+      tagSha: ${{ steps.ref.outputs.tagSha }}
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
       - name: Resolve and validate tag
         id: ref
         shell: bash
@@ -50,18 +54,52 @@ jobs:
             echo "Expected v${XIAOLI_VERSION}; received ${tag}" >&2
             exit 1
           }
+          git show-ref --verify --quiet "refs/tags/${tag}" || {
+            echo "Release tag does not exist: refs/tags/${tag}" >&2
+            exit 1
+          }
+          tag_sha="$(git rev-parse "refs/tags/${tag}^{commit}")"
+          [[ "${tag_sha}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "Could not peel ${tag} to an immutable commit SHA" >&2
+            exit 1
+          }
+          [[ "$(git rev-parse HEAD)" == "${tag_sha}" ]] || {
+            echo "Checked-out commit does not match ${tag}: ${tag_sha}" >&2
+            exit 1
+          }
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main"
+          git merge-base --is-ancestor \
+            "${tag_sha}" "refs/remotes/origin/main" || {
+            echo "Release tag ${tag} (${tag_sha}) is not merged into origin/main" >&2
+            exit 1
+          }
           node scripts/release/verify-version.mjs "${XIAOLI_VERSION}"
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "tagSha=${tag_sha}" >> "${GITHUB_OUTPUT}"
 
-  windows-portable:
-    name: Windows x64 portable
+  quality-gate:
+    name: Release quality gate
     needs: validate-ref
-    runs-on: windows-2022
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
-      - name: Check out source
+      - name: Check out immutable release commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ needs.validate-ref.outputs.tag }}
+          ref: ${{ needs.validate-ref.outputs.tagSha }}
+          fetch-depth: 0
+      - name: Scan committed history for secrets
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl file libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev patchelf wget zip
       - name: Install pnpm
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
@@ -72,6 +110,57 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - name: Scan public tree for private machine artifacts
+        run: |
+          node scripts/release/scan-public-tree.mjs
+          node --test scripts/release/tests/release-gates.test.mjs
+      - name: Install Rust quality components
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.89.0
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Validate version and plugin
+        run: |
+          node scripts/release/verify-version.mjs "${XIAOLI_VERSION}"
+          node scripts/release/validate-plugin.mjs plugin/xiaoli-model-monitor
+      - name: Type-check and build frontend
+        run: |
+          pnpm check
+          pnpm test
+          pnpm build
+      - name: Format-check Rust
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+      - name: Lint Rust
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test Rust
+        working-directory: src-tauri
+        run: cargo test --all-targets --all-features
+
+  windows-portable:
+    name: Windows x64 portable
+    needs: [validate-ref, quality-gate]
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate-ref.outputs.tagSha }}
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10
+          run_install: false
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Remap private Rust build paths
+        run: node scripts/release/prepare-rust-path-remap.mjs
       - name: Install Rust toolchain
         shell: bash
         run: |
@@ -83,6 +172,8 @@ jobs:
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
         with:
           args: --no-bundle
+      - name: Scan executable for private build paths
+        run: node scripts/release/assert-no-private-build-paths.mjs src-tauri/target/release/xiaoli.exe
       - name: Smoke-test executable
         shell: pwsh
         run: >-
@@ -112,13 +203,18 @@ jobs:
 
   macos-portable:
     name: macOS Universal portable
-    needs: validate-ref
-    runs-on: macos-14
+    needs: [validate-ref, quality-gate]
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      # Both slices are linked against the oldest macOS version XiaoLi claims
+      # to support, independently of the macOS 15 runner SDK default.
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ needs.validate-ref.outputs.tag }}
+          ref: ${{ needs.validate-ref.outputs.tagSha }}
       - name: Install pnpm
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
@@ -129,6 +225,8 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - name: Remap private Rust build paths
+        run: node scripts/release/prepare-rust-path-remap.mjs
       - name: Install Rust Universal targets
         shell: bash
         run: |
@@ -141,14 +239,24 @@ jobs:
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
         with:
           args: --target universal-apple-darwin --bundles app
+      - name: Scan app bundle for private build paths
+        run: node scripts/release/assert-no-private-build-paths.mjs src-tauri/target/universal-apple-darwin/release/bundle/macos/XiaoLi.app
       - name: Verify Universal executable and ad-hoc signature
         shell: bash
         run: |
           app="src-tauri/target/universal-apple-darwin/release/bundle/macos/XiaoLi.app"
           test -d "${app}"
           binary="${app}/Contents/MacOS/xiaoli"
-          archs="$(lipo -archs "${binary}")"
-          [[ "${archs}" == *arm64* && "${archs}" == *x86_64* ]]
+          lipo -verify_arch arm64 x86_64 "${binary}"
+          for arch in arm64 x86_64; do
+            thin="${RUNNER_TEMP}/xiaoli-${arch}"
+            lipo "${binary}" -thin "${arch}" -output "${thin}"
+            description="$(file "${thin}")"
+            [[ "${description}" == *"Mach-O 64-bit"* ]]
+            [[ "${description}" == *"${arch}"* ]]
+            [[ "${description}" == *"executable"* ]]
+            otool -l "${thin}" | grep -q "LC_BUILD_VERSION"
+          done
           codesign --verify --deep --strict "${app}"
       - name: Package macOS app ZIP
         shell: bash
@@ -173,13 +281,14 @@ jobs:
 
   linux-portable:
     name: Linux x64 portable
-    needs: validate-ref
+    needs: [validate-ref, quality-gate]
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ needs.validate-ref.outputs.tag }}
+          ref: ${{ needs.validate-ref.outputs.tagSha }}
       - name: Install Linux desktop build dependencies
         run: |
           sudo apt-get update
@@ -196,6 +305,8 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - name: Remap private Rust build paths
+        run: node scripts/release/prepare-rust-path-remap.mjs
       - name: Install Rust toolchain
         run: |
           rustup toolchain install 1.89.0 --profile minimal
@@ -206,13 +317,15 @@ jobs:
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
         with:
           args: --bundles appimage
+      - name: Scan native executable for private build paths
+        run: node scripts/release/assert-no-private-build-paths.mjs src-tauri/target/release/xiaoli
       - name: Smoke-test native executable
         shell: pwsh
         run: >-
           ./scripts/release/Test-Portable.ps1
           -Executable src-tauri/target/release/xiaoli
           -ScratchRoot "${{ runner.temp }}/xiaoli-smoke"
-      - name: Package AppImage archives
+      - name: Extract, scan and package AppImage archives
         shell: bash
         run: >-
           bash ./scripts/release/package-linux.sh
@@ -236,13 +349,14 @@ jobs:
 
   release-metadata:
     name: Plugin, notices and SBOM
-    needs: validate-ref
+    needs: [validate-ref, quality-gate]
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ needs.validate-ref.outputs.tag }}
+          ref: ${{ needs.validate-ref.outputs.tagSha }}
       - name: Install pnpm
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
@@ -277,12 +391,18 @@ jobs:
         with:
           path: .
           format: spdx-json
-          output-file: release-out/XiaoLi-v0.1.0-beta.3.spdx.json
+          syft-version: v1.51.0
+          output-file: release-out/XiaoLi-v0.2.0-beta.1.spdx.json
           upload-artifact: false
           # Publishing is deliberately centralized in the final job. Anchore's
           # default would otherwise attach to a draft left by a failed run and
           # needs contents:write in this read-only metadata job.
           upload-release-assets: false
+      - name: Label and validate source dependency SBOM
+        run: >-
+          node scripts/release/label-sbom.mjs
+          release-out/XiaoLi-v0.2.0-beta.1.spdx.json
+          "${XIAOLI_VERSION}"
       - name: Upload release metadata
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -300,11 +420,12 @@ jobs:
       - linux-portable
       - release-metadata
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ needs.validate-ref.outputs.tag }}
+          ref: ${{ needs.validate-ref.outputs.tagSha }}
       - name: Install Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -338,13 +459,16 @@ jobs:
       - validate-ref
       - assemble
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ needs.validate-ref.outputs.tag }}
+          ref: ${{ needs.validate-ref.outputs.tagSha }}
+          fetch-depth: 0
+          fetch-tags: true
       - name: Install Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -361,27 +485,72 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.validate-ref.outputs.tag }}
+          RELEASE_SHA: ${{ needs.validate-ref.outputs.tagSha }}
         run: |
+          remote_refs="$(git ls-remote origin \
+            "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}")"
+          remote_sha="$(printf '%s\n' "${remote_refs}" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+          if [[ -z "${remote_sha}" ]]; then
+            remote_sha="$(printf '%s\n' "${remote_refs}" | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
+          fi
+          [[ "${remote_sha}" == "${RELEASE_SHA}" ]] || {
+            echo "Remote tag moved or cannot be verified: expected ${RELEASE_SHA}, got ${remote_sha:-missing}" >&2
+            exit 1
+          }
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            is_draft="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft)"
-            [[ "${is_draft}" == "true" ]] || {
-              echo "Refusing to replace an already-published release" >&2
-              exit 1
-            }
+            release_state="$(gh release view "${RELEASE_TAG}" \
+              --json isDraft,isPrerelease \
+              --jq '[.isDraft, .isPrerelease] | @tsv')"
+            IFS=$'\t' read -r is_draft is_prerelease <<< "${release_state}"
+            if [[ "${is_draft}" != "true" ]]; then
+              [[ "${is_prerelease}" == "true" ]] || {
+                echo "Existing published release is not a prerelease" >&2
+                exit 1
+              }
+              published_dir="$(mktemp -d)"
+              gh release download "${RELEASE_TAG}" --dir "${published_dir}"
+              node scripts/release/validate-release.mjs \
+                release-out "${XIAOLI_VERSION}" "${published_dir}"
+              echo "Published ${RELEASE_TAG} already has the identical asset names and SHA256 values"
+              exit 0
+            fi
             while IFS= read -r asset; do
               [[ -z "${asset}" ]] || gh release delete-asset "${RELEASE_TAG}" "${asset}" --yes
             done < <(gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name')
           else
             gh release create "${RELEASE_TAG}" \
+              --verify-tag \
               --draft --prerelease \
               --title "小狸 XiaoLi ${RELEASE_TAG}" \
               --notes-file CHANGELOG.md
           fi
           gh release upload "${RELEASE_TAG}" release-out/* --clobber
-          expected="$(find release-out -maxdepth 1 -type f | wc -l | tr -d ' ')"
-          actual="$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets | length')"
-          [[ "${actual}" == "${expected}" ]] || {
-            echo "Draft asset count mismatch: expected ${expected}, got ${actual}" >&2
+
+          local_manifest="$(mktemp)"
+          remote_manifest="$(mktemp)"
+          find release-out -maxdepth 1 -type f -printf '%f\t%s\n' \
+            | LC_ALL=C sort > "${local_manifest}"
+          gh release view "${RELEASE_TAG}" --json assets \
+            --jq '.assets[] | [.name, (.size | tostring)] | @tsv' \
+            | LC_ALL=C sort > "${remote_manifest}"
+          diff -u "${local_manifest}" "${remote_manifest}" || {
+            echo "Draft assets differ by name or byte size" >&2
+            exit 1
+          }
+
+          download_dir="$(mktemp -d)"
+          gh release download "${RELEASE_TAG}" --dir "${download_dir}"
+          node scripts/release/validate-release.mjs \
+            release-out "${XIAOLI_VERSION}" "${download_dir}"
+
+          remote_refs="$(git ls-remote origin \
+            "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}")"
+          remote_sha="$(printf '%s\n' "${remote_refs}" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+          if [[ -z "${remote_sha}" ]]; then
+            remote_sha="$(printf '%s\n' "${remote_refs}" | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
+          fi
+          [[ "${remote_sha}" == "${RELEASE_SHA}" ]] || {
+            echo "Remote tag moved during upload; leaving the release as a draft" >&2
             exit 1
           }
           gh release edit "${RELEASE_TAG}" --draft=false --prerelease

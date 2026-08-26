@@ -47,6 +47,7 @@ pub fn observed_output_rate(output_tokens: u64, duration_ms: Option<u64>) -> Opt
 pub fn usage_snapshot(
     last: TokenUsage,
     cumulative: TokenUsage,
+    turn: TokenUsage,
     context_window: Option<u64>,
 ) -> UsageSnapshot {
     UsageSnapshot {
@@ -55,6 +56,7 @@ pub fn usage_snapshot(
         context_input_share: context_input_share(&last, context_window),
         last,
         cumulative,
+        turn,
         context_window,
     }
 }

@@ -24,6 +24,21 @@ xiaoli --uninstall-plugin
 - token、缓存、TTFT、速度与行为偏离只用于遥测或黄色“疑似降质”，不能生成虚假的服务器重路由。
 - MCP 只返回正在运行的小狸采集器通过 IPC 提供的快照，并标记 `snapshotSource: liveMonitorIpc`。小狸离线时会明确报错，不会把磁盘旧快照冒充为实时状态。
 
+## 五个脱敏 hook
+
+插件捕获 `SessionStart`、`UserPromptSubmit`、`SubagentStart`、`SubagentStop` 和 `Stop`。处理器 fail-open，只提取会话/回合标识、事件类型、请求模型和时间戳等允许字段；prompt、回复、工具正文、完整 cwd 和 transcript 路径会被丢弃。
+
+## 六个只读 MCP 工具
+
+- `get_monitor_summary()`：活动任务总览。
+- `get_session_detail(threadId)`：指定任务与子智能体的 V5 证据。
+- `render_monitor_card(threadId?, theme?)`：生成可爱或极简监视卡数据。
+- `get_connection_origin(threadId)`：返回脱敏的连接来源分类。
+- `list_relay_audits(limit?)`：列出已有脱敏中转审计。
+- `get_relay_audit(auditId)`：读取一份已有审计报告。
+
+MCP 不能保存 Key、修改 endpoint、启动或取消会消耗额度的主动审计。
+
 ## 本地校验
 
 ```powershell

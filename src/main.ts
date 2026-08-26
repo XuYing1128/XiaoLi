@@ -1,9 +1,26 @@
 import { invoke } from "@tauri-apps/api/core";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 type ThemeName = "cute" | "minimal";
 type StatusLevel = "green" | "yellow" | "red" | "gray";
+type ConnectionOriginKind = "officialChatGpt" | "officialOpenAiApi" | "officialAnthropicApi"
+  | "managedProvider" | "customEndpoint" | "localEndpoint" | "unknown";
+type ConnectionAuthMode = "chatGpt" | "apiKey" | "external" | "unknown";
+type ConnectionOriginConfidence = "configured" | "partial" | "unknown";
+type EndpointClass = "officialChatGpt" | "officialOpenAi" | "officialAnthropic"
+  | "managedProvider" | "customEndpoint" | "localEndpoint" | "unknown";
+
+interface ConnectionOriginSnapshot {
+  kind: ConnectionOriginKind;
+  authMode: ConnectionAuthMode;
+  confidence: ConnectionOriginConfidence;
+  providerId?: string;
+  endpointClass: EndpointClass;
+  evidence: string[];
+  limitations: string[];
+}
 
 interface TokenUsage {
   inputTokens?: number;
@@ -90,11 +107,12 @@ interface ConversationSnapshot {
     observedOutputRate?: number;
   };
   qualityAssessment: QualityAssessment;
+  connectionOrigin: ConnectionOriginSnapshot;
   status: { level: StatusLevel; code: string; explanation: string };
   anomalies: string[];
 }
 
-interface MonitorSnapshotV4 {
+interface MonitorSnapshotV5 {
   schemaVersion: number;
   checkedAt: string;
   codexRunning: boolean;
@@ -103,7 +121,7 @@ interface MonitorSnapshotV4 {
 }
 
 interface UiState {
-  snapshot: MonitorSnapshotV4;
+  snapshot: MonitorSnapshotV5;
   expanded: boolean;
   topmost: boolean;
   theme: ThemeName;
@@ -111,7 +129,7 @@ interface UiState {
   connected: boolean;
   openThreads: Set<string>;
   openAdvanced: Map<string, boolean>;
-  rootDefaultsInitialized: boolean;
+  autoOpenedRootId?: string;
   menuOpen: boolean;
   statusGuideOpen: boolean;
   refreshNotice?: string;
@@ -176,7 +194,7 @@ const state: UiState = {
   connected: false,
   openThreads: new Set<string>(),
   openAdvanced: new Map<string, boolean>(),
-  rootDefaultsInitialized: false,
+  autoOpenedRootId: undefined,
   menuOpen: false,
   statusGuideOpen: Boolean(MOCK_QUERY && URL_OPTIONS.get("guide") === "1"),
 };
@@ -191,12 +209,14 @@ let scrollPointerActive = false;
 let resizeObserver: ResizeObserver | undefined;
 let snapshotEventRevision = 0;
 let snapshotLoadSerial = 0;
+let refreshRequestSerial = 0;
 let preferencesEventRevision = 0;
 let preferencesLoadSerial = 0;
+let statusGuideReturnFocus: HTMLElement | null = null;
 
-function emptySnapshot(): MonitorSnapshotV4 {
+function emptySnapshot(): MonitorSnapshotV5 {
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     checkedAt: new Date().toISOString(),
     codexRunning: false,
     collectorHealth: { level: "gray", parseWarnings: 0 },
@@ -204,7 +224,7 @@ function emptySnapshot(): MonitorSnapshotV4 {
   };
 }
 
-function mockSnapshot(): MonitorSnapshotV4 {
+function mockSnapshot(): MonitorSnapshotV5 {
   const now = Date.now();
   const base: ConversationSnapshot = {
     threadId: "00000000-0000-4000-8000-000000000101",
@@ -248,6 +268,15 @@ function mockSnapshot(): MonitorSnapshotV4 {
       factors: [],
       limitations: ["同桶健康样本不足 30 个，暂不判断行为一致性"],
     },
+    connectionOrigin: {
+      kind: "officialChatGpt",
+      authMode: "chatGpt",
+      confidence: "configured",
+      providerId: "openai",
+      endpointClass: "officialChatGpt",
+      evidence: ["sessionProvider", "authMode"],
+      limitations: [],
+    },
     status: {
       level: "green",
       code: "request_consistent",
@@ -257,11 +286,32 @@ function mockSnapshot(): MonitorSnapshotV4 {
   };
   if (MOCK_QUERY === "collector-red") {
     return {
-      schemaVersion: 4,
+      schemaVersion: 5,
       checkedAt: new Date().toISOString(),
       codexRunning: false,
       collectorHealth: { level: "red", parseWarnings: 0, lastError: "命名管道不可用" },
       conversations: [],
+    };
+  }
+  if (MOCK_QUERY === "origin-custom" || MOCK_QUERY === "origin-unknown") {
+    const originFixture: ConversationSnapshot = {
+      ...base,
+      connectionOrigin: MOCK_QUERY === "origin-custom" ? {
+        kind: "customEndpoint",
+        authMode: "apiKey",
+        confidence: "configured",
+        providerId: "community-relay",
+        endpointClass: "customEndpoint",
+        evidence: ["sessionProvider", "providerEndpoint", "authMode"],
+        limitations: ["physicalModelUnproven"],
+      } : normalizeConnectionOrigin(undefined),
+    };
+    return {
+      schemaVersion: 5,
+      checkedAt: new Date().toISOString(),
+      codexRunning: true,
+      collectorHealth: { level: "green", parseWarnings: 0 },
+      conversations: [originFixture],
     };
   }
   if (MOCK_QUERY === "route-red-generic" || MOCK_QUERY === "route-conflict") {
@@ -278,7 +328,7 @@ function mockSnapshot(): MonitorSnapshotV4 {
         : { level: "red", code: "hook_context_conflict", explanation: "Hook 与 turn_context 请求证据冲突" },
     };
     return {
-      schemaVersion: 4,
+      schemaVersion: 5,
       checkedAt: new Date().toISOString(),
       codexRunning: true,
       collectorHealth: { level: "green", parseWarnings: 0 },
@@ -287,7 +337,7 @@ function mockSnapshot(): MonitorSnapshotV4 {
   }
   if (!["multi", "hierarchy", "pending", "scroll"].includes(MOCK_QUERY ?? "")) {
     return {
-      schemaVersion: 4,
+      schemaVersion: 5,
       checkedAt: new Date().toISOString(),
       codexRunning: true,
       collectorHealth: { level: "green", parseWarnings: 0 },
@@ -344,7 +394,7 @@ function mockSnapshot(): MonitorSnapshotV4 {
       title: `子智能体 ${index + 1} · token 核对`,
     }));
     return {
-      schemaVersion: 4,
+      schemaVersion: 5,
       checkedAt: new Date().toISOString(),
       codexRunning: true,
       collectorHealth: { level: "green", parseWarnings: 0 },
@@ -362,7 +412,7 @@ function mockSnapshot(): MonitorSnapshotV4 {
       status: { level: "yellow", code: "hierarchy_unresolved", explanation: "父会话缺失、失效或会话层级形成环" },
     });
     return {
-      schemaVersion: 4,
+      schemaVersion: 5,
       checkedAt: new Date().toISOString(),
       codexRunning: true,
       collectorHealth: { level: "green", parseWarnings: 0 },
@@ -379,7 +429,7 @@ function mockSnapshot(): MonitorSnapshotV4 {
   }
   if (MOCK_QUERY === "pending") {
     return {
-      schemaVersion: 4,
+      schemaVersion: 5,
       checkedAt: new Date().toISOString(),
       codexRunning: true,
       collectorHealth: { level: "green", parseWarnings: 0 },
@@ -387,7 +437,7 @@ function mockSnapshot(): MonitorSnapshotV4 {
     };
   }
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     checkedAt: new Date().toISOString(),
     codexRunning: true,
     collectorHealth: { level: "green", parseWarnings: 0 },
@@ -523,6 +573,32 @@ function normalizeQualityAssessment(value: unknown): QualityAssessment {
   };
 }
 
+function enumValue<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  const normalized = textValue(value);
+  return normalized && (allowed as readonly string[]).includes(normalized) ? normalized as T : fallback;
+}
+
+function normalizeConnectionOrigin(value: unknown): ConnectionOriginSnapshot {
+  const raw = asRecord(value);
+  const evidence = Array.isArray(raw.evidence) ? raw.evidence.map(normalizeAnomaly) : [];
+  const limitations = Array.isArray(raw.limitations) ? raw.limitations.map(normalizeAnomaly) : [];
+  return {
+    kind: enumValue(pick(raw, "kind"), [
+      "officialChatGpt", "officialOpenAiApi", "officialAnthropicApi", "managedProvider",
+      "customEndpoint", "localEndpoint", "unknown",
+    ] as const, "unknown"),
+    authMode: enumValue(pick(raw, "authMode", "auth_mode"), ["chatGpt", "apiKey", "external", "unknown"] as const, "unknown"),
+    confidence: enumValue(raw.confidence, ["configured", "partial", "unknown"] as const, "unknown"),
+    providerId: textValue(pick(raw, "providerId", "provider_id")),
+    endpointClass: enumValue(pick(raw, "endpointClass", "endpoint_class"), [
+      "officialChatGpt", "officialOpenAi", "officialAnthropic", "managedProvider",
+      "customEndpoint", "localEndpoint", "unknown",
+    ] as const, "unknown"),
+    evidence,
+    limitations,
+  };
+}
+
 function normalizeConversation(value: unknown, index: number): ConversationSnapshot {
   const raw = asRecord(value);
   const route = asRecord(pick(raw, "serverRoute", "server_route"));
@@ -568,6 +644,7 @@ function normalizeConversation(value: unknown, index: number): ConversationSnaps
       observedOutputRate: numberValue(pick(timing, "observedOutputRate", "observed_output_rate", "endToEndOutputRate", "end_to_end_output_rate")),
     },
     qualityAssessment: normalizeQualityAssessment(pick(raw, "qualityAssessment", "quality_assessment")),
+    connectionOrigin: normalizeConnectionOrigin(pick(raw, "connectionOrigin", "connection_origin")),
     status: {
       level: normalizeLevel(status.level, "yellow"),
       code: textValue(status.code) ?? "unknown",
@@ -579,13 +656,13 @@ function normalizeConversation(value: unknown, index: number): ConversationSnaps
   return conversation;
 }
 
-function normalizeSnapshot(value: unknown): MonitorSnapshotV4 {
+function normalizeSnapshot(value: unknown): MonitorSnapshotV5 {
   const envelope = asRecord(value);
   const raw = envelope.snapshot ? asRecord(envelope.snapshot) : envelope;
   const collector = asRecord(pick(raw, "collectorHealth", "collector_health"));
   const conversations = Array.isArray(raw.conversations) ? raw.conversations.map(normalizeConversation) : [];
   return {
-    schemaVersion: numberValue(pick(raw, "schemaVersion", "schema_version")) ?? 4,
+    schemaVersion: numberValue(pick(raw, "schemaVersion", "schema_version")) ?? 5,
     checkedAt: textValue(pick(raw, "checkedAt", "checked_at")) ?? new Date().toISOString(),
     codexRunning: booleanValue(pick(raw, "codexRunning", "codex_running"), conversations.length > 0),
     collectorHealth: {
@@ -874,7 +951,7 @@ function familyLevel(root: ConversationSnapshot, conversations: ConversationSnap
     .reduce((level, conversation) => maxLevel(level, conversation.status.level), root.status.level);
 }
 
-function summaryLevel(snapshot: MonitorSnapshotV4, roots: ConversationSnapshot[]): StatusLevel {
+function summaryLevel(snapshot: MonitorSnapshotV5, roots: ConversationSnapshot[]): StatusLevel {
   let level = snapshot.collectorHealth.level;
   if (snapshot.collectorHealth.parseWarnings > 0) level = maxLevel(level, "yellow");
   if (snapshot.codexRunning) {
@@ -885,23 +962,109 @@ function summaryLevel(snapshot: MonitorSnapshotV4, roots: ConversationSnapshot[]
   return level;
 }
 
-function routeState(conversation: ConversationSnapshot): { explicit: boolean; label: string; tooltip: string } {
+function routeState(conversation: ConversationSnapshot): { explicit: boolean; targetMissing: boolean; targetModel?: string; label: string; tooltip: string } {
   const explicit = isExplicitRouteEvidence(conversation.serverRoute.evidence, conversation.serverRoute.chain);
   const activeModel = friendlyModel(conversation.activeRequest.model);
-  const routeModel = friendlyModel(conversation.serverRoute.model);
   const lastHop = conversation.serverRoute.chain[conversation.serverRoute.chain.length - 1];
-  if (explicit && conversation.serverRoute.model) {
+  const targetModel = conversation.serverRoute.model ?? lastHop?.toModel;
+  if (explicit && targetModel) {
     const reason = lastHop?.reason ? `\n原因：${lastHop.reason}` : "";
     return {
       explicit: true,
-      label: `${activeModel} → ${routeModel}`,
+      targetMissing: false,
+      targetModel,
+      label: `${activeModel} → ${friendlyModel(targetModel)}`,
       tooltip: `服务器已重路由\n证据：${conversation.serverRoute.evidence}${reason}`,
+    };
+  }
+  if (explicit) {
+    const chain = conversation.serverRoute.chain
+      .map((hop) => [hop.fromModel, hop.toModel].filter(Boolean).map(friendlyModel).join(" → "))
+      .filter(Boolean)
+      .join(" → ");
+    return {
+      explicit: true,
+      targetMissing: true,
+      label: chain || `${activeModel} → 目标未知`,
+      tooltip: `已捕获明确的 model/rerouted 证据，但目标模型字段缺失。\n证据：${conversation.serverRoute.evidence}`,
     };
   }
   return {
     explicit: false,
+    targetMissing: false,
     label: "未见服务器重路由",
     tooltip: "小狸没有捕获到明确的 model/rerouted 事件。这里只能确认本回合请求模型；这不证明服务器物理模型没有变化。",
+  };
+}
+
+const ORIGIN_KIND_COPY: Record<ConnectionOriginKind, { label: string; short: string }> = {
+  officialChatGpt: { label: "官方 ChatGPT 登录", short: "ChatGPT" },
+  officialOpenAiApi: { label: "官方 OpenAI API", short: "OpenAI" },
+  officialAnthropicApi: { label: "官方 Anthropic API", short: "Anthropic" },
+  managedProvider: { label: "托管提供商", short: "托管" },
+  customEndpoint: { label: "自定义端点", short: "自定义" },
+  localEndpoint: { label: "本地端点", short: "本地" },
+  unknown: { label: "连接来源未知", short: "未知" },
+};
+
+const ORIGIN_CONFIDENCE_COPY: Record<ConnectionOriginConfidence, { label: string; short: string }> = {
+  configured: { label: "配置证据完整", short: "配置" },
+  partial: { label: "仅有部分证据", short: "部分" },
+  unknown: { label: "证据不足", short: "不足" },
+};
+
+const AUTH_MODE_COPY: Record<ConnectionAuthMode, string> = {
+  chatGpt: "ChatGPT 登录",
+  apiKey: "API Key",
+  external: "外部认证",
+  unknown: "未知",
+};
+
+function connectionOriginDisplay(origin: ConnectionOriginSnapshot): {
+  label: string;
+  compact: string;
+  tooltip: string;
+  className: string;
+} {
+  const kind = ORIGIN_KIND_COPY[origin.kind];
+  const confidence = ORIGIN_CONFIDENCE_COPY[origin.confidence];
+  const evidence = origin.evidence.length > 0 ? origin.evidence.join("、") : "无";
+  const limitations = origin.limitations.length > 0 ? origin.limitations.join("、") : "无";
+  return {
+    label: `${kind.label} · ${confidence.label}`,
+    compact: `${kind.short} · ${confidence.short}`,
+    className: origin.kind === "unknown" ? "is-unknown" : origin.kind === "customEndpoint" || origin.kind === "localEndpoint" ? "is-custom" : "is-known",
+    tooltip: [
+      `连接来源：${kind.label}`,
+      `置信度：${confidence.label}`,
+      `认证方式：${AUTH_MODE_COPY[origin.authMode]}`,
+      `Provider：${origin.providerId ?? "未知"}`,
+      `证据：${evidence}`,
+      `限制：${limitations}`,
+      "这是连接配置来源证据，不是服务器物理模型身份证明。",
+    ].join("\n"),
+  };
+}
+
+function compactOriginSummary(conversations: ConversationSnapshot[]): { label: string; tooltip: string; className: string } {
+  const unique = new Map<string, ConnectionOriginSnapshot>();
+  for (const conversation of conversations) {
+    const origin = conversation.connectionOrigin;
+    unique.set(`${origin.kind}:${origin.confidence}`, origin);
+  }
+  if (unique.size === 1) {
+    const display = connectionOriginDisplay([...unique.values()][0]);
+    return { label: display.compact, tooltip: display.tooltip, className: display.className };
+  }
+  if (unique.size === 0) {
+    const display = connectionOriginDisplay(normalizeConnectionOrigin(undefined));
+    return { label: display.compact, tooltip: display.tooltip, className: display.className };
+  }
+  const descriptions = [...unique.values()].map((origin) => connectionOriginDisplay(origin));
+  return {
+    label: `${unique.size} 种来源 · 混合证据`,
+    tooltip: `${descriptions.map((item) => item.label).join("\n")}\n连接来源不等于服务器物理模型身份。`,
+    className: "is-mixed",
   };
 }
 
@@ -925,7 +1088,7 @@ function conciseExplanation(value: string | undefined, maxLength = 46): string {
   return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 1)}…`;
 }
 
-function collectorIssueText(snapshot: MonitorSnapshotV4): string | undefined {
+function collectorIssueText(snapshot: MonitorSnapshotV5): string | undefined {
   if (snapshot.collectorHealth.lastError) return conciseExplanation(snapshot.collectorHealth.lastError);
   if (snapshot.collectorHealth.level === "red") return "采集器发生确定性故障";
   if (snapshot.collectorHealth.parseWarnings > 0) return `${snapshot.collectorHealth.parseWarnings} 个解析警告`;
@@ -933,7 +1096,7 @@ function collectorIssueText(snapshot: MonitorSnapshotV4): string | undefined {
   return undefined;
 }
 
-function snapshotExplanation(snapshot: MonitorSnapshotV4): string {
+function snapshotExplanation(snapshot: MonitorSnapshotV5): string {
   const collectorIssue = collectorIssueText(snapshot);
   let collectorLevel = snapshot.collectorHealth.level;
   if (snapshot.collectorHealth.lastError) collectorLevel = "red";
@@ -948,6 +1111,7 @@ function snapshotExplanation(snapshot: MonitorSnapshotV4): string {
 
 function buildConversationTooltip(conversation: ConversationSnapshot): string {
   const route = routeState(conversation);
+  const origin = connectionOriginDisplay(conversation.connectionOrigin);
   const usage = conversation.usage.cumulative;
   const hops = conversation.serverRoute.chain
     .map((hop) => `${friendlyModel(hop.fromModel)} → ${friendlyModel(hop.toModel)}${hop.reason ? `：${hop.reason}` : ""}`)
@@ -960,6 +1124,8 @@ function buildConversationTooltip(conversation: ConversationSnapshot): string {
     `请求模型：${conversation.activeRequest.model ?? "未知"}`,
     `请求 effort：${conversation.activeRequest.effort ?? "未知"}`,
     `路由证据：${route.label}`,
+    `连接来源：${origin.label}`,
+    "连接来源不是服务器物理模型身份证明。",
     conversation.status.level === "green" || conversation.status.level === "gray"
       ? ""
       : `状态说明：${conversation.status.explanation}`,
@@ -996,7 +1162,7 @@ function renderMochi(level: StatusLevel): string {
   </div>`;
 }
 
-function renderCompactSummary(snapshot: MonitorSnapshotV4, roots: ConversationSnapshot[]): string {
+function renderCompactSummary(snapshot: MonitorSnapshotV5, roots: ConversationSnapshot[]): string {
   const overallLevel = summaryLevel(snapshot, roots);
   const collectorIssue = collectorIssueText(snapshot);
   if (!snapshot.codexRunning) {
@@ -1021,21 +1187,23 @@ function renderCompactSummary(snapshot: MonitorSnapshotV4, roots: ConversationSn
     const model = friendlyModel(conversation.activeRequest.model);
     const effort = conversation.activeRequest.effort ?? "effort 未知";
     const routeConflict = isRoutePolicyConflict(conversation);
+    const origin = compactOriginSummary(family);
     const explanation = overallLevel === "yellow" || overallLevel === "red" ? snapshotExplanation(snapshot) : undefined;
     const tooltip = [buildConversationTooltip(conversation), explanation ? `状态说明：${explanation}` : ""].filter(Boolean).join("\n");
     const requestEvidence = pending
       ? `<span class="phase-label">本回合</span><span class="model-flow">${escapeHtml(model)}</span><span class="dot-separator">·</span><span class="effort">${escapeHtml(effort)}（请求）</span>`
-      : route.explicit && conversation.serverRoute.model
-        ? `<span class="model-flow">${escapeHtml(model)} <span class="route-arrow ${routeConflict ? "is-conflict" : ""}">→ ${escapeHtml(friendlyModel(conversation.serverRoute.model))}</span></span><span class="dot-separator">·</span><span class="effort">${escapeHtml(effort)}（请求）</span>`
+      : route.explicit && route.targetModel
+        ? `<span class="model-flow">${escapeHtml(model)} <span class="route-arrow ${routeConflict ? "is-conflict" : ""}">→ ${escapeHtml(friendlyModel(route.targetModel))}</span></span><span class="dot-separator">·</span><span class="effort">${escapeHtml(effort)}（请求）</span>`
         : `<span class="model-flow">${escapeHtml(model)}</span><span class="dot-separator">·</span><span class="effort">${escapeHtml(effort)}（请求）</span>`;
     const metrics = `<span>${formatTokens(familyUsage.total)} tok</span><span class="metric-separator">·</span><span>缓存输入 ${formatPercent(familyUsage.cacheShare)}</span>`;
     const secondary = pending
       ? `<span class="pending-next-line"><span class="phase-label">下一回合</span> ${escapeHtml(pending)}（待生效）</span>${explanation ? `<span class="compact-wide-alert status-${overallLevel}"><span class="metric-separator">·</span>${escapeHtml(explanation)}</span>` : ""}`
       : explanation
         ? `<span class="compact-alert status-${overallLevel}" title="${escapeHtml(explanation)}">${escapeHtml(explanation)}</span><span class="compact-wide-metrics"><span class="metric-separator">·</span>${metrics}</span>`
-        : `${metrics}<span class="route-wide-label"><span class="metric-separator">·</span>${route.explicit ? "服务器已重路由" : "未见服务器重路由"}</span>`;
+        : `${metrics}<span class="route-wide-label ${route.targetMissing ? "status-yellow" : ""}"${route.targetMissing ? ' style="color:var(--yellow)"' : ""}><span class="metric-separator">·</span>${route.targetMissing ? "已重路由，目标未知" : route.explicit ? "服务器已重路由" : "未见服务器重路由"}</span>`;
     return `<div class="compact-primary" title="${escapeHtml(tooltip)}">${requestEvidence}<span class="compact-wide-title"><span class="dot-separator">·</span>${escapeHtml(conversation.title)}</span>
-        <span class="route-mark ${route.explicit ? "is-explicit" : "is-unknown"} ${routeConflict ? "is-conflict" : ""}" title="${escapeHtml(route.tooltip)}" aria-label="${escapeHtml(route.label)}">${icon(route.explicit ? "route" : "shield")}</span>
+        <span class="route-mark ${route.explicit ? "is-explicit" : "is-unknown"} ${route.targetMissing ? "status-yellow" : ""} ${routeConflict ? "is-conflict" : ""}"${route.targetMissing && !routeConflict ? ' style="color:var(--yellow)"' : ""} title="${escapeHtml(route.tooltip)}" aria-label="${escapeHtml(route.label)}">${icon(route.explicit ? "route" : "shield")}</span>
+        <span class="compact-origin ${origin.className}" title="${escapeHtml(origin.tooltip)}" aria-label="${escapeHtml(origin.label)}">${escapeHtml(origin.label)}</span>
       </div><div class="compact-secondary" title="${escapeHtml(explanation ?? (pending ? `下一回合 ${pending}（待生效）` : ""))}">${secondary}</div>`;
   }
   const counts = roots.reduce((result, conversation) => {
@@ -1045,8 +1213,9 @@ function renderCompactSummary(snapshot: MonitorSnapshotV4, roots: ConversationSn
   const usage = aggregateUsage(snapshot.conversations);
   const statusParts = [counts.green ? `${counts.green} 正常` : "", counts.yellow ? `${counts.yellow} 待确认` : "", counts.red ? `${counts.red} 异常` : ""].filter(Boolean);
   const explanation = overallLevel === "yellow" || overallLevel === "red" ? snapshotExplanation(snapshot) : undefined;
+  const origin = compactOriginSummary(snapshot.conversations);
   const metrics = `<span>${formatTokens(usage.total)} tok</span><span class="metric-separator">·</span><span>缓存输入 ${formatPercent(usage.cacheShare)}</span>`;
-  return `<div class="compact-primary" title="${escapeHtml([statusParts.join(" · "), explanation].filter(Boolean).join("\n"))}"><span>${roots.length} 个对话</span><span class="dot-separator">·</span><span class="conversation-counts">${escapeHtml(statusParts.join(" · "))}</span></div>
+  return `<div class="compact-primary" title="${escapeHtml([statusParts.join(" · "), explanation].filter(Boolean).join("\n"))}"><span>${roots.length} 个对话</span><span class="dot-separator">·</span><span class="conversation-counts">${escapeHtml(statusParts.join(" · "))}</span><span class="compact-origin ${origin.className}" title="${escapeHtml(origin.tooltip)}" aria-label="${escapeHtml(origin.label)}">${escapeHtml(origin.label)}</span></div>
     <div class="compact-secondary" title="${escapeHtml(explanation ?? "")}">${explanation ? `<span class="compact-alert status-${overallLevel}">${escapeHtml(explanation)}</span><span class="compact-wide-metrics"><span class="metric-separator">·</span>${metrics}</span>` : metrics}</div>`;
 }
 
@@ -1084,7 +1253,7 @@ function metricValues(conversation: ConversationSnapshot): Array<{ key: string; 
   ];
 }
 
-function collectorCopy(snapshot: MonitorSnapshotV4): { level: StatusLevel; text: string; tooltip: string } {
+function collectorCopy(snapshot: MonitorSnapshotV5): { level: StatusLevel; text: string; tooltip: string } {
   const health = snapshot.collectorHealth;
   if (health.level === "red") return { level: "red", text: "采集故障", tooltip: health.lastError ?? "采集器发生确定性故障" };
   if (health.parseWarnings > 0) return { level: "yellow", text: `${health.parseWarnings} 个解析警告`, tooltip: health.lastError ?? "部分日志行无法解析；未损坏的结构化证据仍会显示" };
@@ -1114,7 +1283,7 @@ function createConversationCard(threadId: string): HTMLDetailsElement {
   card.dataset.scrollKey = `thread:${threadId}`;
   card.innerHTML = `<summary data-focus-key="thread:${escapeHtml(threadId)}">
       <span class="conversation-status status-gray" aria-hidden="true">–</span>
-      <span class="conversation-copy"><span class="conversation-title-line"><span class="kind-label" hidden>子任务</span><strong class="conversation-title"></strong><time></time></span>
+      <span class="conversation-copy"><span class="conversation-title-line"><span class="kind-label" hidden>子任务</span><strong class="conversation-title"></strong><time></time><span class="origin-mini is-unknown"></span></span>
       <span class="conversation-model-line"><span class="request-line"></span><span class="pending-mini" hidden></span><span class="conversation-family-stats"></span></span></span>
       <span class="status-badge status-gray"><span class="status-symbol" aria-hidden="true">–</span><span class="status-label">空闲</span></span><span class="details-chevron" aria-hidden="true">${icon("expand")}</span>
     </summary>
@@ -1123,6 +1292,7 @@ function createConversationCard(threadId: string): HTMLDetailsElement {
       <div class="evidence-block">
         <div class="evidence-line"><span class="evidence-label">本回合请求</span><strong class="request-evidence"></strong></div>
         <div class="evidence-line"><span class="evidence-label">服务器路由</span><span class="route-evidence is-unknown"><span class="route-icon">${icon("shield")}</span><span class="route-label"></span></span></div>
+        <div class="evidence-line"><span class="evidence-label">连接来源</span><span class="origin-evidence is-unknown"><span class="origin-label"></span></span></div>
         <div class="pending-callout" role="status" hidden><span class="pending-clock" aria-hidden="true">◷</span><span>下一回合：<strong class="pending-value"></strong>（待生效）</span></div>
         <div class="source-note"></div>
       </div>
@@ -1130,6 +1300,7 @@ function createConversationCard(threadId: string): HTMLDetailsElement {
         threadId, kind: "root", title: "", activeRequest: {}, serverRoute: { evidence: "unknown", chain: [] },
         usage: { last: {}, cumulative: {} }, timing: { ttftEvidence: { kind: "pending" } },
         qualityAssessment: { state: "learning", baselineSampleCount: 0, consecutiveHits: 0, factors: [], limitations: [] },
+        connectionOrigin: normalizeConnectionOrigin(undefined),
         status: { level: "gray", code: "", explanation: "" }, anomalies: [],
       }).map((metric) => `<div class="metric" data-metric="${metric.key}" data-focus-key="metric:${escapeHtml(threadId)}:${metric.key}" tabindex="0"><span class="metric-label"></span><strong class="metric-value"></strong></div>`).join("")}</div>
       <details class="quality-box" data-focus-key="quality:${escapeHtml(threadId)}">
@@ -1170,6 +1341,14 @@ function updateConversationCard(
   if (kind) { kind.hidden = !isChild; kind.textContent = conversation.kind === "subagent" ? "子智能体" : "子会话"; }
   setText(card, ".conversation-title", conversation.title);
   setText(card, ".conversation-title-line time", relativeAge(conversation.sourceTimestamp));
+  const origin = connectionOriginDisplay(conversation.connectionOrigin);
+  const originMini = card.querySelector<HTMLElement>(".origin-mini");
+  if (originMini) {
+    originMini.className = `origin-mini ${origin.className}`;
+    originMini.textContent = origin.compact;
+    originMini.title = origin.tooltip;
+    originMini.setAttribute("aria-label", origin.label);
+  }
   setText(card, ".request-line", `${friendlyModel(conversation.activeRequest.model)} · ${conversation.activeRequest.effort ?? "effort 未知"}（请求）`);
   const pending = pendingLabel(conversation);
   const pendingMini = card.querySelector<HTMLElement>(".pending-mini");
@@ -1213,7 +1392,9 @@ function updateConversationCard(
   const route = routeState(conversation);
   const routeElement = card.querySelector<HTMLElement>(".route-evidence");
   if (routeElement) {
-    routeElement.className = `route-evidence ${route.explicit ? "is-explicit" : "is-unknown"}${isRoutePolicyConflict(conversation) ? " is-conflict" : ""}`;
+    const routeConflict = isRoutePolicyConflict(conversation);
+    routeElement.className = `route-evidence ${route.explicit ? "is-explicit" : "is-unknown"}${route.targetMissing ? " status-yellow" : ""}${routeConflict ? " is-conflict" : ""}`;
+    routeElement.style.color = route.targetMissing && !routeConflict ? "var(--yellow)" : "";
     routeElement.title = route.tooltip;
   }
   const routeIcon = card.querySelector<HTMLElement>(".route-icon");
@@ -1222,6 +1403,12 @@ function updateConversationCard(
     routeIcon.innerHTML = icon(route.explicit ? "route" : "shield");
   }
   setText(card, ".route-label", route.label);
+  const originEvidence = card.querySelector<HTMLElement>(".origin-evidence");
+  if (originEvidence) {
+    originEvidence.className = `origin-evidence ${origin.className}`;
+    originEvidence.title = origin.tooltip;
+  }
+  setText(card, ".origin-label", origin.label);
   const pendingCallout = card.querySelector<HTMLElement>(".pending-callout");
   setHidden(pendingCallout, !pending);
   if (pending) setText(card, ".pending-value", pending);
@@ -1424,12 +1611,15 @@ function markScrollInteraction(): void {
   }
 }
 
-function syncConversationList(snapshot: MonitorSnapshotV4, roots: ConversationSnapshot[]): void {
+function syncConversationList(snapshot: MonitorSnapshotV5, roots: ConversationSnapshot[]): void {
   const scroller = app.querySelector<HTMLElement>(".conversation-scroll");
   if (!scroller) return;
-  if (!state.rootDefaultsInitialized && state.expanded && roots.length > 0) {
-    if (roots.length === 1) state.openThreads.add(roots[0].threadId);
-    state.rootDefaultsInitialized = true;
+  const rootIds = new Set(roots.map((root) => root.threadId));
+  if (roots.length === 0) state.autoOpenedRootId = undefined;
+  else if (state.autoOpenedRootId && !rootIds.has(state.autoOpenedRootId)) state.autoOpenedRootId = undefined;
+  if (state.expanded && roots.length === 1 && state.autoOpenedRootId !== roots[0].threadId) {
+    state.openThreads.add(roots[0].threadId);
+    state.autoOpenedRootId = roots[0].threadId;
   }
   const anchor = captureScrollAnchor(scroller);
   const restoreGeneration = scrollInteractionGeneration;
@@ -1507,7 +1697,7 @@ function mountShell(): void {
     </header>
     <section class="expanded-panel" aria-label="活动对话详情">
       <header class="panel-heading"><div><strong>活动对话</strong><span class="count-pill">0</span></div><span class="collector-health status-gray"><i aria-hidden="true"></i><span></span></span></header>
-      <div class="conversation-scroll" role="list" tabindex="-1"></div>
+      <div class="conversation-scroll" aria-label="活动对话与子任务" tabindex="-1"></div>
       <footer class="panel-footer">
         <button class="text-button" type="button" data-action="theme" data-focus-key="footer-theme">${icon("theme")}<span></span></button>
         <button class="text-button refresh-button" type="button" data-action="refresh" data-focus-key="footer-refresh">${icon("refresh")}<span></span></button>
@@ -1532,6 +1722,7 @@ function mountShell(): void {
         <article class="status-guide-item status-gray"><i aria-hidden="true">–</i><div><strong>空闲</strong><p>Codex 未运行，或当前没有活动回合。小狸会继续在后台等待结构化事件。</p></div></article>
         <article class="status-guide-item route-guide"><i aria-hidden="true">↝</i><div><strong>服务器已重路由</strong><p>只在捕获明确的 <code>model/rerouted</code> 事件时出现，并显示请求模型到服务器目标的链。</p></div></article>
         <article class="status-guide-item route-guide"><i aria-hidden="true">◇</i><div><strong>未见服务器重路由</strong><p>只表示小狸没有捕获显式 reroute 事件；它不证明服务器物理模型没有发生变化。</p></div></article>
+        <article class="status-guide-item route-guide"><i aria-hidden="true">⌁</i><div><strong>连接来源</strong><p>显示官方登录、官方 API、自定义、本地或未知端点，并区分配置证据、部分证据和证据不足。它只说明连接配置，不能证明服务器物理模型。</p></div></article>
         <article class="status-guide-item route-guide"><i aria-hidden="true">◷</i><div><strong>下一回合待生效</strong><p>活动回合中修改模型或 effort 后，本回合继续保持原请求值，新值要到下一回合开始才成为活动请求。</p></div></article>
         <article class="status-guide-item route-guide"><i aria-hidden="true">◌</i><div><strong>学习中 / 行为一致</strong><p>同桶健康样本少于 30 个时只学习；达到门槛后可比较 TTFT、模型阶段速率与推理比例。行为一致也不等于路由已认证。</p></div></article>
         <article class="status-guide-item route-guide"><i aria-hidden="true">●</i><div><strong>采集徽标</strong><p>“采集正常、解析警告、采集待确认、采集故障、Codex 未运行 / 采集状态未知”只描述采集器健康与运行环境；解析警告会保留仍可解析的证据。</p></div></article>
@@ -1539,7 +1730,7 @@ function mountShell(): void {
         <article class="status-guide-item route-guide"><i aria-hidden="true">↻</i><div><strong>刷新中 / 已合并 / 超时 / 失败</strong><p>刷新请求在后台单飞执行，重复点击只合并一次尾随刷新。超时或失败都会保留上一份有效快照；失败提示会显示精简原因，二者都不会伪装成服务器模型结论。</p></div></article>
       </div>
     </section>
-    <button class="resize-grip" type="button" aria-label="拖动以调整窗口大小" title="调整窗口大小" data-focus-key="resize-grip"><span aria-hidden="true"></span></button>
+    <div class="resize-grip" role="separator" aria-orientation="horizontal" aria-label="调整窗口大小；左右键调宽度，上下键调高度，Shift 加速" aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown" title="拖动或使用方向键调整窗口大小" tabindex="0" data-focus-key="resize-grip"><span aria-hidden="true"></span></div>
   </main><div class="sr-only" aria-live="polite" aria-atomic="true"></div>`;
   resizeObserver = new ResizeObserver(([entry]) => {
     if (!entry) return;
@@ -1632,6 +1823,15 @@ function renderNow(): void {
   const statusGuide = app.querySelector<HTMLElement>(".status-guide");
   setHidden(statusGuide, !state.statusGuideOpen);
   if (statusGuide) statusGuide.setAttribute("aria-hidden", String(!state.statusGuideOpen));
+  for (const element of app.querySelectorAll<HTMLElement>(".compact-bar, .expanded-panel, .more-menu, .resize-grip")) {
+    element.inert = state.statusGuideOpen;
+  }
+  const compactBar = app.querySelector<HTMLElement>(".compact-bar");
+  if (compactBar) {
+    if (state.statusGuideOpen) compactBar.setAttribute("aria-hidden", "true");
+    else compactBar.removeAttribute("aria-hidden");
+  }
+  if (panel) panel.setAttribute("aria-hidden", String(state.statusGuideOpen || !state.expanded));
   setText(app, ".sr-only", `${STATUS_COPY[level].short}，${roots.length} 个活动对话，更新于 ${relativeAge(snapshot.checkedAt)}`);
 }
 
@@ -1647,7 +1847,7 @@ async function invokeCommand<T>(command: string, args?: Record<string, unknown>)
   return invoke<T>(command, args);
 }
 
-function errorSnapshot(error: unknown): MonitorSnapshotV4 {
+function errorSnapshot(error: unknown): MonitorSnapshotV5 {
   const message = error instanceof Error ? error.message : String(error);
   return {
     ...state.snapshot,
@@ -1777,6 +1977,8 @@ async function loadPluginInstallStatus(): Promise<void> {
 
 async function refreshNow(): Promise<void> {
   if (state.refreshing) return;
+  const requestId = ++refreshRequestSerial;
+  const eventRevisionAtStart = snapshotEventRevision;
   state.refreshing = true;
   state.refreshNotice = undefined;
   render();
@@ -1790,7 +1992,12 @@ async function refreshNow(): Promise<void> {
       : Promise.resolve({ status: "completed" as const, snapshot: mockSnapshot() });
     const result = await Promise.race([command, timeout]);
     if (result === "timeout") {
+      if (requestId === refreshRequestSerial) refreshRequestSerial += 1;
       state.refreshNotice = "本次刷新超时，已保留上一份有效数据";
+      return;
+    }
+    if (requestId !== refreshRequestSerial || eventRevisionAtStart !== snapshotEventRevision) {
+      state.refreshNotice = result.status === "coalesced" ? "已合并重复刷新，实时数据已更新" : undefined;
       return;
     }
     state.snapshot = normalizeSnapshot(result.snapshot);
@@ -1798,6 +2005,7 @@ async function refreshNow(): Promise<void> {
     state.refreshNotice = result.status === "coalesced" ? "已合并重复刷新" : undefined;
   }
   catch (error) {
+    if (requestId !== refreshRequestSerial || eventRevisionAtStart !== snapshotEventRevision) return;
     const message = error instanceof Error ? error.message : String(error);
     state.refreshNotice = `刷新失败：${conciseExplanation(message, 34)}`;
   }
@@ -1821,6 +2029,29 @@ function closeMoreMenu(restoreFocus: boolean): void {
   }
 }
 
+function setStatusGuideOpen(open: boolean): void {
+  if (open === state.statusGuideOpen) return;
+  if (open) {
+    const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    statusGuideReturnFocus = active?.closest(".more-menu")
+      ? app.querySelector<HTMLButtonElement>('[data-action="more"]')
+      : active;
+    closeMoreMenu(false);
+  }
+  state.statusGuideOpen = open;
+  render();
+  window.requestAnimationFrame(() => {
+    if (open) {
+      app.querySelector<HTMLButtonElement>('.status-guide [data-action="status-guide"]')?.focus({ preventScroll: true });
+    } else {
+      const target = statusGuideReturnFocus;
+      statusGuideReturnFocus = null;
+      if (target?.isConnected) target.focus({ preventScroll: true });
+      else app.querySelector<HTMLButtonElement>('[data-action="more"]')?.focus({ preventScroll: true });
+    }
+  });
+}
+
 async function runAction(action: string, origin: ActionOrigin = "programmatic"): Promise<void> {
   switch (action) {
     case "expand": await toggleExpanded(); break;
@@ -1840,10 +2071,7 @@ async function runAction(action: string, origin: ActionOrigin = "programmatic"):
       catch (error) { if (IS_TAURI) console.error("reset_window_position failed", error); }
       break;
     case "status-guide":
-      closeMoreMenu(false);
-      state.statusGuideOpen = !state.statusGuideOpen;
-      render();
-      if (state.statusGuideOpen) requestAnimationFrame(() => app.querySelector<HTMLButtonElement>('.status-guide [data-action="status-guide"]')?.focus({ preventScroll: true }));
+      setStatusGuideOpen(!state.statusGuideOpen);
       break;
     case "hide":
       closeMoreMenu(false);
@@ -2025,9 +2253,44 @@ function cleanup(): void {
   resizeObserver?.disconnect();
 }
 
+async function resizeWindowFromKeyboard(key: string, accelerated: boolean): Promise<void> {
+  if (!IS_TAURI) return;
+  const step = accelerated ? 32 : 8;
+  try {
+    const windowHandle = getCurrentWindow();
+    const [physicalSize, scaleFactor] = await Promise.all([windowHandle.innerSize(), windowHandle.scaleFactor()]);
+    const width = physicalSize.width / scaleFactor + (key === "ArrowRight" ? step : key === "ArrowLeft" ? -step : 0);
+    const height = physicalSize.height / scaleFactor + (key === "ArrowDown" ? step : key === "ArrowUp" ? -step : 0);
+    await windowHandle.setSize(new LogicalSize(Math.max(1, width), Math.max(1, height)));
+  } catch (error) {
+    console.error("keyboard window resize failed", error);
+  }
+}
+
 window.addEventListener("beforeunload", cleanup, { once: true });
 window.addEventListener("keydown", (event) => {
   const target = event.target;
+  if (target instanceof Element && target.closest(".resize-grip") && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+    event.preventDefault();
+    void resizeWindowFromKeyboard(event.key, event.shiftKey);
+    return;
+  }
+  if (state.statusGuideOpen && event.key === "Tab") {
+    const guide = app.querySelector<HTMLElement>(".status-guide");
+    const focusable = guide
+      ? Array.from(guide.querySelectorAll<HTMLElement>('button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'))
+        .filter((element) => !element.hidden)
+      : [];
+    if (focusable.length > 0) {
+      event.preventDefault();
+      const current = focusable.indexOf(document.activeElement as HTMLElement);
+      const next = event.shiftKey
+        ? (current <= 0 ? focusable.length - 1 : current - 1)
+        : (current < 0 || current === focusable.length - 1 ? 0 : current + 1);
+      focusable[next]?.focus({ preventScroll: true });
+    }
+    return;
+  }
   if (target instanceof Element && target.closest(".conversation-scroll") && ["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End", " "].includes(event.key)) {
     markScrollInteraction();
   }
@@ -2036,7 +2299,7 @@ window.addEventListener("keydown", (event) => {
     if (!state.menuOpen) void runAction("more", "keyboard");
     return;
   }
-  if (event.key === "Escape" && state.statusGuideOpen) { event.preventDefault(); state.statusGuideOpen = false; render(); return; }
+  if (event.key === "Escape" && state.statusGuideOpen) { event.preventDefault(); setStatusGuideOpen(false); return; }
   if (event.key === "Escape" && state.menuOpen) { event.preventDefault(); closeMoreMenu(true); return; }
   if (state.menuOpen && ["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
     const items = Array.from(app.querySelectorAll<HTMLButtonElement>('.more-menu [role="menuitem"]:not(:disabled)'));

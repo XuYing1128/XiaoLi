@@ -134,8 +134,9 @@ button:focus-visible, summary:focus-visible, [tabindex="0"]:focus-visible { outl
   font-size: clamp(12px, calc(12px * var(--ui-scale)), 15px); font-variant-numeric: tabular-nums; letter-spacing: -.02em;
 }
 .model-flow, .conversation-counts, .effort { overflow: hidden; min-width: 0; text-overflow: ellipsis; white-space: nowrap; }
+.compact-primary > .model-flow, .compact-primary > .effort, .compact-primary > .phase-label { flex: 0 0 auto; }
 .compact-wide-title, .route-wide-label { display: none; min-width: 0; overflow: hidden; color: var(--text-faint); text-overflow: ellipsis; white-space: nowrap; }
-:root[data-wide="true"] .compact-wide-title, :root[data-wide="true"] .route-wide-label { display: inline-flex; align-items: center; }
+:root[data-wide="true"] .compact-wide-title, :root[data-wide="true"] .route-wide-label { display: inline-flex; min-width: 0; flex: 1 1 24px; align-items: center; }
 .phase-label { flex: 0 0 auto; margin-right: 4px; color: var(--text-soft); font-family: var(--font-ui); font-weight: 700; }
 .pending-next-line, .compact-alert { overflow: hidden; min-width: 0; text-overflow: ellipsis; white-space: nowrap; }
 .pending-next-line { display: inline-flex; align-items: center; color: var(--blue); font-weight: 700; }
@@ -147,6 +148,14 @@ button:focus-visible, summary:focus-visible, [tabindex="0"]:focus-visible { outl
 .route-mark { display: inline-flex; width: 18px; height: 18px; flex: 0 0 18px; align-items: center; justify-content: center; margin-left: 4px; }
 .route-mark svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.55; }
 .route-mark.is-unknown { color: var(--gray); } .route-mark.is-explicit { color: var(--blue); } .route-mark.is-conflict { color: var(--red); }
+.compact-origin, .origin-mini {
+  display: inline-flex; min-width: 0; align-items: center; overflow: hidden; border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-radius: 999px; color: var(--blue); background: color-mix(in srgb, currentColor 7%, white); font-family: var(--font-ui);
+  font-size: max(10.5px, calc(10.5px * var(--ui-scale))); font-weight: 700; line-height: 18px; text-overflow: ellipsis; white-space: nowrap;
+}
+.compact-origin { max-width: 88px; flex: 0 1 88px; margin-left: 3px; padding: 0 6px; }
+.compact-origin.is-custom, .origin-mini.is-custom, .origin-evidence.is-custom { color: var(--ink-purple); }
+.compact-origin.is-unknown, .origin-mini.is-unknown, .origin-evidence.is-unknown { color: var(--gray); }
 
 .controls-host { position: relative; z-index: 24; min-width: 58px; cursor: default; }
 .window-controls { display: flex; min-width: 58px; align-items: center; justify-content: flex-end; gap: 2px; }
@@ -214,6 +223,7 @@ button:focus-visible, summary:focus-visible, [tabindex="0"]:focus-visible { outl
 .conversation-title-line, .conversation-model-line { display: flex; min-width: 0; align-items: center; overflow: hidden; white-space: nowrap; }
 .conversation-title { overflow: hidden; min-width: 0; color: var(--text); font-size: clamp(12.5px, calc(13px * var(--ui-scale)), 16px); font-weight: 750; text-overflow: ellipsis; }
 .conversation-title-line time { flex: 0 0 auto; margin-left: 6px; color: var(--text-faint); font-size: max(10.5px, calc(10.5px * var(--ui-scale))); }
+.origin-mini { max-width: 112px; flex: 0 1 auto; margin-left: 6px; padding: 0 6px; line-height: 17px; }
 .conversation-model-line {
   display: grid; grid-template-columns: minmax(82px, 1fr) auto; gap: 7px; color: var(--text-soft); font-family: var(--font-data);
   font-size: clamp(12px, calc(12px * var(--ui-scale)), 14px); font-variant-numeric: tabular-nums;
@@ -248,12 +258,13 @@ button:focus-visible, summary:focus-visible, [tabindex="0"]:focus-visible { outl
 .evidence-block { display: grid; gap: 7px; padding: 10px 0 9px; }
 .evidence-line { display: grid; min-width: 0; grid-template-columns: 88px minmax(0, 1fr); align-items: center; gap: 10px; color: var(--text); font-size: clamp(12px, calc(12px * var(--ui-scale)), 15px); }
 .evidence-line strong { overflow: hidden; min-width: 0; font-family: var(--font-data); font-size: clamp(12px, calc(12px * var(--ui-scale)), 14px); font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
-.evidence-line strong, .evidence-line .route-evidence { justify-self: end; text-align: right; }
+.evidence-line strong, .evidence-line .route-evidence, .evidence-line .origin-evidence { justify-self: end; text-align: right; }
 .evidence-label { color: var(--text-soft); }
 .route-evidence { display: inline-flex; min-width: 0; align-items: center; gap: 5px; overflow: hidden; color: var(--gray); font-size: clamp(12px, calc(12px * var(--ui-scale)), 14px); text-overflow: ellipsis; white-space: nowrap; }
 .route-evidence svg { width: 14px; height: 14px; flex: 0 0 14px; }
 .route-evidence.is-explicit { color: var(--blue); font-weight: 750; }
 .route-evidence.is-conflict { color: var(--red); }
+.origin-evidence { display: inline-flex; min-width: 0; align-items: center; overflow: hidden; color: var(--blue); font-size: clamp(12px, calc(12px * var(--ui-scale)), 14px); font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .pending-callout { display: flex; align-items: center; gap: 7px; padding: 7px 8px; border-left: 3px solid var(--blue); border-radius: 0 7px 7px 0; color: var(--blue); background: var(--blue-soft); font-size: 12px; }
 .pending-clock { font-size: 15px; } .source-note { color: var(--text-faint); font-size: max(10.5px, calc(10.5px * var(--ui-scale))); }
 

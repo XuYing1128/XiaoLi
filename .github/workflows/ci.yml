@@ -69,6 +69,9 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      - name: Remap private Rust build paths
+        run: node scripts/release/prepare-rust-path-remap.mjs
+
       - name: Install Rust toolchain
         shell: bash
         run: |
@@ -81,8 +84,20 @@ jobs:
       - name: Validate plugin package
         run: node scripts/release/validate-plugin.mjs plugin/xiaoli-model-monitor
 
+      - name: Validate public tree and release gates
+        run: |
+          node scripts/release/verify-version.mjs 0.2.0-beta.1
+          node scripts/release/scan-public-tree.mjs
+          node --test scripts/release/tests/release-gates.test.mjs
+
       - name: Type-check frontend
         run: pnpm check
+
+      - name: Test frontend behavior
+        run: pnpm test
+
+      - name: Build frontend
+        run: pnpm build
 
       - name: Format-check Rust
         working-directory: src-tauri
@@ -100,6 +115,9 @@ jobs:
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
         with:
           args: --no-bundle
+
+      - name: Scan native executable for private build paths
+        run: node scripts/release/assert-no-private-build-paths.mjs "${{ matrix.executable }}"
 
       - name: Smoke-test portable executable
         shell: pwsh
