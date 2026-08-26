@@ -103,7 +103,7 @@ Codex 界面显示的是你选择的模型和思考档位，但开发者还会�
 
 1. 下载并解压 `XiaoLi-v0.2.0-beta.1-macOS-universal.app.zip`。
 2. 将 `XiaoLi.app` 移到“应用程序”，然后打开。
-3. 首个 beta 采用 ad-hoc 签名、未公证。如果 Gatekeeper 阻止启动，请在“系统设置 → 隐私与安全性”中核对应用后选择“仍要打开”。项目不会提供关闭 Gatekeeper 的脚本。
+3. 首个 beta 采用 ad-hoc 签名、未公证。如果 Gatekeeper 阻止启动，请在“系统设置 → 隐私与安全性”中核对应用后选择“仍要打开”。
 
 ### Linux x64
 
