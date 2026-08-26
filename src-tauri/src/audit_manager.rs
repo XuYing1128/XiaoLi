@@ -18,17 +18,20 @@ use crate::private_probe_pack::{
 };
 use crate::relay_audit::{
     assess_paired_quality, assess_quality_degradation, assess_usage_padding, audit_budget,
-    check_usage_arithmetic, compare_cell_fingerprints, derive_overall_verdict,
-    fingerprint_prompt_variants, generate_probe_plan, is_strict_model_id, normalize_probe_response,
-    safe_model_id, string_kernel_mmd_permutation, AnthropicThinkingStructureState, AuditDetector,
-    AuditLifecycle, AuditMode, AuditParametersSnapshot, CellFingerprint, ConnectionEvidence,
-    EvidenceConfidence, IdentityAssessment, IdentityAssessmentKind, NormalizedProbeResponse,
+    check_usage_arithmetic_for_protocol, compare_cell_fingerprints, derive_overall_verdict,
+    fingerprint_prompt_variants, generate_probe_plan, is_strict_model_id, normalize_audit_effort,
+    normalize_probe_response, safe_model_id, string_kernel_mmd_permutation,
+    AnthropicThinkingStructureState, AntiEvasionAssessment, AntiEvasionAssessmentKind,
+    AntiEvasionFactor, AntiEvasionSignal, AuditDetector, AuditLifecycle, AuditMode,
+    AuditParametersSnapshot, CellFingerprint, ConnectionEvidence, EvidenceConfidence,
+    FingerprintProbeCohort, IdentityAssessment, IdentityAssessmentKind, NormalizedProbeResponse,
     OverallVerdict, PairedBaselineSummary, PairedQualityObservation, ProbeCase, ProbeCellKey,
     ProtocolAssessment, ProtocolAssessmentKind, QualityDomain, RelayAuditProgress,
     RelayAuditReportV1, RelayAuditRequest, RelayProfile, ReportedUsage, SafeResponseMetadata,
-    UsageAssessment, UsageScaleEvidence, DEFAULT_STRING_MMD_PERMUTATIONS,
-    RELAY_AUDIT_REPORT_SCHEMA_VERSION,
+    TrustedStaticBaselineSummary, UsageAssessment, UsageScaleEvidence,
+    DEFAULT_STRING_MMD_PERMUTATIONS, RELAY_AUDIT_REPORT_SCHEMA_VERSION,
 };
+use crate::relay_baseline::{score_trusted_relay_baseline, TrustedRelayBaselinePackage};
 use crate::relay_transport::{
     RelayAuditMessage, RelayAuditMessageRole, RelayAuditTool, SanitizedToolCall,
 };
@@ -72,6 +75,7 @@ pub struct TransportAuditCase {
     pub audit_id: String,
     pub profile: RelayProfile,
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub case_id: String,
     pub kind: TransportCaseKind,
     pub detector: AuditDetector,
@@ -248,7 +252,20 @@ impl AuditManager {
         request: RelayAuditRequest,
         credential: String,
     ) -> Result<AuditStartReceipt, String> {
-        self.start_internal(profile, request, credential, None)
+        self.start_internal(profile, request, credential, None, None)
+    }
+
+    /// Starts a target-only audit with a previously verified static baseline.
+    /// The baseline adds no network requests and is used only for the
+    /// low-confidence identity fingerprint axis.
+    pub fn start_with_trusted_baseline(
+        &self,
+        profile: RelayProfile,
+        request: RelayAuditRequest,
+        credential: String,
+        trusted_baseline: TrustedRelayBaselinePackage,
+    ) -> Result<AuditStartReceipt, String> {
+        self.start_internal(profile, request, credential, None, Some(trusted_baseline))
     }
 
     /// Starts a target/official paired audit. Both endpoints receive the same
@@ -271,6 +288,7 @@ impl AuditManager {
                 profile: reference_profile,
                 credential: reference_credential,
             }),
+            None,
         )
     }
 
@@ -315,10 +333,14 @@ impl AuditManager {
         mut request: RelayAuditRequest,
         credential: String,
         reference: Option<PairedAuditReference>,
+        trusted_baseline: Option<TrustedRelayBaselinePackage>,
     ) -> Result<AuditStartReceipt, String> {
         validate_profile_binding(&profile, &request)?;
         if let Some(reference) = reference.as_ref() {
             validate_paired_reference(&profile, &request, &reference.profile)?;
+        }
+        if let Some(trusted_baseline) = trusted_baseline.as_ref() {
+            validate_trusted_baseline_reference(&profile, &request, trusted_baseline)?;
         }
         let private_probe_pack = load_private_pack_for_request(&request)?;
 
@@ -394,6 +416,7 @@ impl AuditManager {
         let thread_cancelled = Arc::clone(&cancelled);
         let planned_cases = planned.clone();
         let thread_reference = reference;
+        let thread_trusted_baseline = trusted_baseline;
         let spawn_result = thread::Builder::new()
             .name(format!("xiaoli-audit-{}", short_id(&audit_id)))
             .spawn(move || {
@@ -410,6 +433,7 @@ impl AuditManager {
                         &thread_request,
                         &credential,
                         thread_reference.as_ref(),
+                        thread_trusted_baseline.as_ref(),
                         &planned_cases,
                         transport.as_ref(),
                         &thread_cancelled,
@@ -514,6 +538,34 @@ impl AuditManager {
         } else {
             false
         }
+    }
+
+    /// Bounds only terminal snapshots retained as a persistence fallback.
+    /// Active runs are never eligible because they still own cancellation and
+    /// request-budget state. The newest terminal snapshots are retained.
+    pub fn prune_terminal_snapshots(&self, retain: usize) -> usize {
+        let mut runs = lock_recover(&self.runs);
+        let mut terminal = runs
+            .iter()
+            .filter(|(_, run)| run.snapshot.status.terminal())
+            .map(|(id, run)| {
+                (
+                    id.clone(),
+                    run.snapshot
+                        .completed_at
+                        .clone()
+                        .unwrap_or_else(|| run.snapshot.started_at.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        terminal.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
+        let mut removed = 0;
+        for (audit_id, _) in terminal.into_iter().skip(retain) {
+            if runs.remove(&audit_id).is_some() {
+                removed += 1;
+            }
+        }
+        removed
     }
 
     pub fn cancel_all(&self) -> usize {
@@ -626,6 +678,7 @@ struct StoredObservation {
     bounded_text_sample: Option<String>,
     bounded_tool_call: Option<SanitizedToolCall>,
     input_token_estimate: u64,
+    elapsed_ms: u64,
 }
 
 #[derive(Default)]
@@ -646,6 +699,7 @@ fn execute_audit(
     request: &RelayAuditRequest,
     credential: &str,
     reference: Option<&PairedAuditReference>,
+    trusted_baseline: Option<&TrustedRelayBaselinePackage>,
     planned: &[PlannedCase],
     transport: &dyn RelayTransportAdapter,
     cancelled: &AtomicBool,
@@ -798,6 +852,33 @@ fn execute_audit(
             )
         })
         .unwrap_or_else(|| assess_quality_degradation(0, &[]));
+    let anti_evasion_enabled = matches!(request.mode, AuditMode::Standard | AuditMode::Deep)
+        && (request.enabled_detectors.is_empty()
+            || request
+                .enabled_detectors
+                .contains(&AuditDetector::CacheBehavior));
+    let anti_evasion = if anti_evasion_enabled {
+        reference
+            .map(|_| {
+                paired_anti_evasion_assessment(
+                    planned,
+                    &target.observations,
+                    &reference_evidence.observations,
+                    request.mode,
+                )
+            })
+            .unwrap_or_else(|| AntiEvasionAssessment {
+                state: AntiEvasionAssessmentKind::InsufficientEvidence,
+                reasons: vec![
+                    "matched official observations are required for anti-evasion behavior checks"
+                        .to_owned(),
+                ],
+                limitations: anti_evasion_limitations(),
+                ..AntiEvasionAssessment::default()
+            })
+    } else {
+        AntiEvasionAssessment::default()
+    };
     let eligible_cells_without_reference = target
         .probe_samples
         .iter()
@@ -806,7 +887,13 @@ fn execute_audit(
                 .is_eligible()
         })
         .count();
-    let identity = if let Some(reference) = reference {
+    let fingerprint_enabled = request.enabled_detectors.is_empty()
+        || request
+            .enabled_detectors
+            .contains(&AuditDetector::Fingerprint);
+    let identity = if !fingerprint_enabled {
+        identity_without_reference(0, target.reported_model.is_some())
+    } else if let Some(reference) = reference {
         identity_with_reference(
             request.mode,
             &target.probe_samples,
@@ -815,19 +902,26 @@ fn execute_audit(
             &reference.profile,
             &request.model,
         )
+    } else if let Some(trusted_baseline) = trusted_baseline {
+        score_trusted_relay_baseline(
+            &target.probe_samples,
+            trusted_baseline,
+            profile.protocol,
+            &request.model,
+            request.effort.as_deref(),
+            Utc::now(),
+        )
     } else {
         identity_without_reference(
             eligible_cells_without_reference,
             target.reported_model.is_some(),
         )
     };
-    let fingerprint_enabled = request.enabled_detectors.is_empty()
-        || request
-            .enabled_detectors
-            .contains(&AuditDetector::Fingerprint);
-    let community_baseline =
-        (reference.is_none() && fingerprint_enabled && !target.probe_samples.is_empty())
-            .then(|| compare_release_community_baselines(&target.probe_samples));
+    let community_baseline = (reference.is_none()
+        && trusted_baseline.is_none()
+        && fingerprint_enabled
+        && !target.probe_samples.is_empty())
+    .then(|| compare_release_community_baselines(&target.probe_samples));
     let eligible_cells = identity.eligible_cells;
 
     let lifecycle = if was_cancelled {
@@ -837,7 +931,13 @@ fn execute_audit(
     } else {
         AuditLifecycle::Completed
     };
-    let verdict = derive_overall_verdict(lifecycle, &protocol, &usage, &quality, &identity);
+    let mut verdict = derive_overall_verdict(lifecycle, &protocol, &usage, &quality, &identity);
+    if trusted_baseline.is_some() && reference.is_none() && verdict == OverallVerdict::Consistent {
+        // A static package can authenticate its publisher and provide useful
+        // low-confidence distance evidence, but it cannot substitute for a
+        // live same-run official reference when issuing an overall PASS.
+        verdict = OverallVerdict::InsufficientEvidence;
+    }
     let status = match lifecycle {
         AuditLifecycle::Cancelled => AuditRunStatus::Cancelled,
         AuditLifecycle::Failed => AuditRunStatus::Failed,
@@ -851,6 +951,18 @@ fn execute_audit(
             .to_owned(),
         "response text was normalized in memory and was not retained in this report".to_owned(),
     ];
+    if request.effort.is_none() {
+        limitations.push(
+            "reasoning effort was not explicitly requested; provider defaults may affect behavioral comparison"
+                .to_owned(),
+        );
+        if profile.protocol == crate::relay_audit::RelayProtocol::AnthropicMessages {
+            limitations.push(
+                "Anthropic Messages does not expose the OpenAI reasoning effort parameter; this audit left effort unspecified"
+                    .to_owned(),
+            );
+        }
+    }
     if reference.is_some() {
         limitations.push(
             "target and official-reference requests were randomly interleaved with independent per-endpoint budgets"
@@ -858,6 +970,19 @@ fn execute_audit(
         );
         limitations.push(
             "paired behavioral agreement still cannot cryptographically prove the physical serving model"
+                .to_owned(),
+        );
+    } else if trusted_baseline.is_some() {
+        limitations.push(
+            "a locally trusted signed static fingerprint package was used only for low-confidence identity comparison"
+                .to_owned(),
+        );
+        limitations.push(
+            "the package signature authenticates its publisher, not the collection process or physical serving model"
+                .to_owned(),
+        );
+        limitations.push(
+            "static-reference agreement cannot by itself set the overall verdict to consistent"
                 .to_owned(),
         );
     } else if request.official_baseline_profile_id.is_some() {
@@ -905,7 +1030,7 @@ fn execute_audit(
         ));
     }
 
-    let reasons = verdict_reasons(
+    let mut reasons = verdict_reasons(
         verdict,
         &protocol,
         &usage,
@@ -913,6 +1038,12 @@ fn execute_audit(
         successful_count,
         reference.is_some(),
     );
+    if anti_evasion.state == AntiEvasionAssessmentKind::SuspiciousBehavior {
+        reasons.push(format!(
+            "yellow anti-evasion behavior warning: {} independent signals persisted across both batches",
+            anti_evasion.persistent_signals.len()
+        ));
+    }
     let report = RelayAuditReportV1 {
         schema_version: RELAY_AUDIT_REPORT_SCHEMA_VERSION,
         audit_id: audit_id.to_owned(),
@@ -928,6 +1059,7 @@ fn execute_audit(
         completed_at: Some(completed_at),
         parameters: AuditParametersSnapshot {
             mode: request.mode,
+            effort: request.effort.clone(),
             max_requests: request.max_requests,
             max_input_tokens: request.max_input_tokens,
             max_output_tokens: request.max_output_tokens,
@@ -953,11 +1085,24 @@ fn execute_audit(
         usage_reconciliation: usage,
         quality_findings: quality,
         fingerprint_findings: identity,
+        anti_evasion_findings: anti_evasion,
         paired_baseline: reference.map(|reference| PairedBaselineSummary {
             profile_id: reference.profile.id.clone(),
             model: safe_model_id(&request.model),
+            effort: request.effort.clone(),
             protocol: reference.profile.protocol,
             completed_cases: reference_evidence.successful_count.min(u32::MAX as usize) as u32,
+        }),
+        trusted_static_baseline: trusted_baseline.map(|baseline| TrustedStaticBaselineSummary {
+            baseline_id: baseline.payload.id.clone(),
+            model: safe_model_id(&baseline.payload.model),
+            effort: baseline.payload.effort.clone(),
+            protocol: baseline.payload.protocol,
+            version: baseline.payload.version.clone(),
+            signing_key_id: baseline.signing_key_id.clone(),
+            verified_at: baseline.verified_at.clone(),
+            expires_at: baseline.payload.expires_at.clone(),
+            confidence: EvidenceConfidence::Low,
         }),
         community_baseline,
         selective_service_assessment: None,
@@ -997,7 +1142,10 @@ fn collect_observation(
     }
     evidence
         .usage_checks
-        .push(check_usage_arithmetic(&observation.usage));
+        .push(check_usage_arithmetic_for_protocol(
+            &observation.usage,
+            case.operation.profile.protocol,
+        ));
     // Only structurally valid responses may influence behavioral, quality or
     // paired-usage comparisons. A self-reported model mismatch remains a
     // protocol finding but does not by itself discard an otherwise valid
@@ -1021,6 +1169,7 @@ fn collect_observation(
                 bounded_text_sample: observation.bounded_text_sample,
                 bounded_tool_call: observation.bounded_tool_call,
                 input_token_estimate: observation.input_token_estimate,
+                elapsed_ms: observation.elapsed_ms,
             },
         );
     }
@@ -1057,10 +1206,11 @@ fn paired_usage_scales(
         let Some(reference_observation) = reference.get(&case.operation.case_id) else {
             continue;
         };
-        let Some(target_excess) = visible_input_excess(target_observation) else {
+        let protocol = case.operation.profile.protocol;
+        let Some(target_excess) = visible_input_excess(target_observation, protocol) else {
             continue;
         };
-        let Some(reference_excess) = visible_input_excess(reference_observation) else {
+        let Some(reference_excess) = visible_input_excess(reference_observation, protocol) else {
             continue;
         };
         let entry = grouped.entry(scale).or_default();
@@ -1080,12 +1230,28 @@ fn paired_usage_scales(
         .collect()
 }
 
-fn visible_input_excess(observation: &StoredObservation) -> Option<f64> {
-    observation
-        .usage
-        .input_tokens
-        .map(|reported| reported as f64 - observation.input_token_estimate as f64)
-        .filter(|value| value.is_finite())
+fn visible_input_excess(
+    observation: &StoredObservation,
+    protocol: crate::relay_audit::RelayProtocol,
+) -> Option<f64> {
+    let usage = &observation.usage;
+    let reported = match protocol {
+        crate::relay_audit::RelayProtocol::AnthropicMessages => {
+            usage.input_tokens?;
+            [
+                usage.input_tokens,
+                usage.cache_creation_input_tokens,
+                usage.cached_input_tokens,
+            ]
+            .into_iter()
+            .flatten()
+            .try_fold(0_i64, i64::checked_add)?
+        }
+        crate::relay_audit::RelayProtocol::OpenAiResponses
+        | crate::relay_audit::RelayProtocol::OpenAiChatCompletions => usage.input_tokens?,
+    };
+    let value = reported as f64 - observation.input_token_estimate as f64;
+    value.is_finite().then_some(value)
 }
 
 fn paired_quality_assessment(
@@ -1115,6 +1281,390 @@ fn paired_quality_assessment(
         AuditMode::Deep => 8,
     };
     assess_paired_quality(&observations, required_samples, seed)
+}
+
+fn paired_anti_evasion_assessment(
+    planned: &[PlannedCase],
+    target: &BTreeMap<String, StoredObservation>,
+    reference: &BTreeMap<String, StoredObservation>,
+    mode: AuditMode,
+) -> AntiEvasionAssessment {
+    if !matches!(mode, AuditMode::Standard | AuditMode::Deep) {
+        return AntiEvasionAssessment::default();
+    }
+    let samples = planned
+        .iter()
+        .filter_map(|case| {
+            let probe = case.probe.as_ref()?;
+            let target_observation = target.get(&case.operation.case_id)?;
+            let reference_observation = reference.get(&case.operation.case_id)?;
+            Some(BehaviorPair {
+                batch_index: probe.batch_index,
+                cell: probe.cell,
+                cohort: probe.cohort,
+                target_response: normalized_probe_value(probe, target_observation),
+                reference_response: normalized_probe_value(probe, reference_observation),
+                target_elapsed_ms: target_observation.elapsed_ms,
+                reference_elapsed_ms: reference_observation.elapsed_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    let required_cells = match mode {
+        AuditMode::Standard => 4,
+        AuditMode::Deep => 10,
+        AuditMode::Connection | AuditMode::Quick => unreachable!(),
+    };
+    let mut factors = Vec::new();
+    for batch_index in 0..2 {
+        let batch = samples
+            .iter()
+            .filter(|sample| sample.batch_index == batch_index)
+            .collect::<Vec<_>>();
+        let batch_id = format!("anti-evasion-batch-{batch_index}");
+
+        if let Some((target_collision, reference_collision, paired_samples)) =
+            mean_canonical_collision(&batch, required_cells)
+        {
+            factors.push(AntiEvasionFactor {
+                batch_id: batch_id.clone(),
+                signal: AntiEvasionSignal::CacheDistributionCollapse,
+                paired_samples,
+                target_primary: target_collision,
+                reference_primary: reference_collision,
+                target_secondary: None,
+                reference_secondary: None,
+                primary_threshold: 0.75,
+                secondary_threshold: Some(0.30),
+                suspicious: target_collision >= 0.75
+                    && target_collision >= reference_collision + 0.30,
+            });
+        }
+
+        let target_latencies = batch
+            .iter()
+            .map(|sample| sample.target_elapsed_ms as f64)
+            .collect::<Vec<_>>();
+        let reference_latencies = batch
+            .iter()
+            .map(|sample| sample.reference_elapsed_ms as f64)
+            .collect::<Vec<_>>();
+        let required_latency_samples = required_cells.saturating_mul(10);
+        if target_latencies.len() >= required_latency_samples
+            && reference_latencies.len() >= required_latency_samples
+        {
+            if let (Some((target_median, target_mad)), Some((reference_median, reference_mad))) = (
+                median_and_mad(&target_latencies),
+                median_and_mad(&reference_latencies),
+            ) {
+                let suspicious = reference_median > 0.0
+                    && target_median <= reference_median * 0.35
+                    && target_mad <= (reference_mad * 0.25).max(2.0);
+                factors.push(AntiEvasionFactor {
+                    batch_id: batch_id.clone(),
+                    signal: AntiEvasionSignal::SuspiciouslyLowStableLatency,
+                    paired_samples: target_latencies.len().min(reference_latencies.len()),
+                    target_primary: target_median,
+                    reference_primary: reference_median,
+                    target_secondary: Some(target_mad),
+                    reference_secondary: Some(reference_mad),
+                    primary_threshold: 0.35,
+                    secondary_threshold: Some(0.25),
+                    suspicious,
+                });
+            }
+        }
+
+        for (signal, cohort) in [
+            (
+                AntiEvasionSignal::ParaphraseDrift,
+                FingerprintProbeCohort::Paraphrase,
+            ),
+            (
+                AntiEvasionSignal::RoleFormatSensitivity,
+                FingerprintProbeCohort::RoleFormat,
+            ),
+        ] {
+            if let Some((target_jsd, reference_jsd, paired_samples)) =
+                mean_cohort_drift(&batch, cohort, required_cells)
+            {
+                factors.push(AntiEvasionFactor {
+                    batch_id: batch_id.clone(),
+                    signal,
+                    paired_samples,
+                    target_primary: target_jsd,
+                    reference_primary: reference_jsd,
+                    target_secondary: None,
+                    reference_secondary: None,
+                    primary_threshold: 0.30,
+                    secondary_threshold: Some(0.20),
+                    suspicious: target_jsd >= 0.30 && target_jsd >= reference_jsd + 0.20,
+                });
+            }
+        }
+    }
+
+    let persistent_signals = [
+        AntiEvasionSignal::CacheDistributionCollapse,
+        AntiEvasionSignal::SuspiciouslyLowStableLatency,
+        AntiEvasionSignal::ParaphraseDrift,
+        AntiEvasionSignal::RoleFormatSensitivity,
+    ]
+    .into_iter()
+    .filter(|signal| {
+        factors
+            .iter()
+            .filter(|factor| factor.signal == *signal && factor.suspicious)
+            .map(|factor| factor.batch_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            == 2
+    })
+    .collect::<Vec<_>>();
+    let evaluable_signals = [
+        AntiEvasionSignal::CacheDistributionCollapse,
+        AntiEvasionSignal::SuspiciouslyLowStableLatency,
+        AntiEvasionSignal::ParaphraseDrift,
+        AntiEvasionSignal::RoleFormatSensitivity,
+    ]
+    .into_iter()
+    .filter(|signal| {
+        factors
+            .iter()
+            .filter(|factor| factor.signal == *signal)
+            .map(|factor| factor.batch_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            == 2
+    })
+    .collect::<Vec<_>>();
+    let state = if evaluable_signals.len() < 2 {
+        AntiEvasionAssessmentKind::InsufficientEvidence
+    } else if persistent_signals.len() >= 2 {
+        AntiEvasionAssessmentKind::SuspiciousBehavior
+    } else {
+        AntiEvasionAssessmentKind::Consistent
+    };
+    let reasons = match state {
+        AntiEvasionAssessmentKind::NotRun => Vec::new(),
+        AntiEvasionAssessmentKind::InsufficientEvidence => vec![format!(
+            "at least two independent signals, each with {required_cells} matched cells in both batches, were required; {} signal(s) were evaluable",
+            evaluable_signals.len()
+        )],
+        AntiEvasionAssessmentKind::Consistent => vec![
+            "fewer than two independent anti-evasion signals persisted across both batches"
+                .to_owned(),
+        ],
+        AntiEvasionAssessmentKind::SuspiciousBehavior => vec![format!(
+            "{} independent behavior signals persisted across both batches",
+            persistent_signals.len()
+        )],
+    };
+    AntiEvasionAssessment {
+        state,
+        persistent_signals,
+        factors,
+        reasons,
+        limitations: anti_evasion_limitations(),
+    }
+}
+
+#[derive(Clone)]
+struct BehaviorPair {
+    batch_index: usize,
+    cell: ProbeCellKey,
+    cohort: FingerprintProbeCohort,
+    target_response: Option<String>,
+    reference_response: Option<String>,
+    target_elapsed_ms: u64,
+    reference_elapsed_ms: u64,
+}
+
+fn normalized_probe_value(probe: &ProbeCase, observation: &StoredObservation) -> Option<String> {
+    let sample = observation.bounded_text_sample.as_deref()?;
+    match normalize_probe_response(probe.cell.family, probe.cell.language, sample) {
+        NormalizedProbeResponse::Valid(value) => Some(value),
+        NormalizedProbeResponse::Empty
+        | NormalizedProbeResponse::Refusal
+        | NormalizedProbeResponse::Invalid => None,
+    }
+}
+
+fn mean_canonical_collision(
+    batch: &[&BehaviorPair],
+    required_cells: usize,
+) -> Option<(f64, f64, usize)> {
+    let mut grouped = BTreeMap::<ProbeCellKey, (Vec<&str>, Vec<&str>)>::new();
+    for sample in batch
+        .iter()
+        .copied()
+        .filter(|sample| sample.cohort == FingerprintProbeCohort::Canonical)
+    {
+        let (Some(target), Some(reference)) = (
+            sample.target_response.as_deref(),
+            sample.reference_response.as_deref(),
+        ) else {
+            continue;
+        };
+        let entry = grouped.entry(sample.cell).or_default();
+        entry.0.push(target);
+        entry.1.push(reference);
+    }
+    let eligible = grouped
+        .values()
+        .filter(|(target, reference)| target.len() >= 3 && reference.len() >= 3)
+        .collect::<Vec<_>>();
+    if eligible.len() < required_cells {
+        return None;
+    }
+    let target = eligible
+        .iter()
+        .map(|(samples, _)| collision_probability(samples))
+        .sum::<f64>()
+        / eligible.len() as f64;
+    let reference = eligible
+        .iter()
+        .map(|(_, samples)| collision_probability(samples))
+        .sum::<f64>()
+        / eligible.len() as f64;
+    let paired_samples = eligible
+        .iter()
+        .map(|(target, reference)| target.len().min(reference.len()))
+        .sum();
+    Some((target, reference, paired_samples))
+}
+
+fn collision_probability(samples: &[&str]) -> f64 {
+    if samples.len() < 2 {
+        return 0.0;
+    }
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for sample in samples {
+        *counts.entry(*sample).or_default() += 1;
+    }
+    let collisions = counts
+        .values()
+        .map(|count| count.saturating_mul(count.saturating_sub(1)))
+        .sum::<usize>();
+    collisions as f64 / samples.len().saturating_mul(samples.len() - 1) as f64
+}
+
+fn mean_cohort_drift(
+    batch: &[&BehaviorPair],
+    cohort: FingerprintProbeCohort,
+    required_cells: usize,
+) -> Option<(f64, f64, usize)> {
+    type CohortSamples<'a> = (Vec<&'a str>, Vec<&'a str>, Vec<&'a str>, Vec<&'a str>);
+    let mut grouped = BTreeMap::<ProbeCellKey, CohortSamples<'_>>::new();
+    for sample in batch.iter().copied() {
+        if !matches!(
+            sample.cohort,
+            FingerprintProbeCohort::Canonical
+                | FingerprintProbeCohort::Paraphrase
+                | FingerprintProbeCohort::RoleFormat
+        ) {
+            continue;
+        }
+        let (Some(target), Some(reference)) = (
+            sample.target_response.as_deref(),
+            sample.reference_response.as_deref(),
+        ) else {
+            continue;
+        };
+        let entry = grouped.entry(sample.cell).or_default();
+        if sample.cohort == FingerprintProbeCohort::Canonical {
+            entry.0.push(target);
+            entry.2.push(reference);
+        } else if sample.cohort == cohort {
+            entry.1.push(target);
+            entry.3.push(reference);
+        }
+    }
+    let mut target_values = Vec::new();
+    let mut reference_values = Vec::new();
+    let mut paired_samples = 0_usize;
+    for (target_base, target_variant, reference_base, reference_variant) in grouped.values() {
+        if target_base.len() < 3
+            || target_variant.len() < 3
+            || reference_base.len() < 3
+            || reference_variant.len() < 3
+        {
+            continue;
+        }
+        let target_base = frequency_counts(target_base);
+        let target_variant = frequency_counts(target_variant);
+        let reference_base = frequency_counts(reference_base);
+        let reference_variant = frequency_counts(reference_variant);
+        let Some(target_jsd) =
+            crate::relay_audit::js_divergence_base2(&target_base, &target_variant)
+        else {
+            continue;
+        };
+        let Some(reference_jsd) =
+            crate::relay_audit::js_divergence_base2(&reference_base, &reference_variant)
+        else {
+            continue;
+        };
+        target_values.push(target_jsd);
+        reference_values.push(reference_jsd);
+        let comparable = target_base
+            .values()
+            .copied()
+            .sum::<u64>()
+            .min(target_variant.values().copied().sum::<u64>())
+            .min(reference_base.values().copied().sum::<u64>())
+            .min(reference_variant.values().copied().sum::<u64>());
+        paired_samples = paired_samples.saturating_add(comparable as usize);
+    }
+    if target_values.len() < required_cells || reference_values.len() < required_cells {
+        return None;
+    }
+    Some((
+        target_values.iter().sum::<f64>() / target_values.len() as f64,
+        reference_values.iter().sum::<f64>() / reference_values.len() as f64,
+        paired_samples,
+    ))
+}
+
+fn frequency_counts(samples: &[&str]) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for sample in samples {
+        *counts.entry((*sample).to_owned()).or_default() += 1;
+    }
+    counts
+}
+
+fn median_and_mad(values: &[f64]) -> Option<(f64, f64)> {
+    let median_value = median(values)?;
+    let deviations = values
+        .iter()
+        .map(|value| (value - median_value).abs())
+        .collect::<Vec<_>>();
+    Some((median_value, median(&deviations)?))
+}
+
+fn median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let middle = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 0 {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
+    } else {
+        sorted[middle]
+    })
+}
+
+fn anti_evasion_limitations() -> Vec<String> {
+    vec![
+        "anti-evasion behavior warnings are yellow-only and never prove model identity"
+            .to_owned(),
+        "cache policy, network proximity, provider load, and sampling randomness can affect these aggregates"
+            .to_owned(),
+        "a relay that recognizes all audit traffic may still selectively serve a different path"
+            .to_owned(),
+    ]
 }
 
 fn score_quality_probe(specification: &QualityProbeSpec, observation: &StoredObservation) -> bool {
@@ -1187,7 +1737,7 @@ fn identity_with_reference(
         })
         .flatten();
     let enough_cells = eligible_cells >= required_cells;
-    let reference_different = if !enough_cells {
+    let experimental_difference = if !enough_cells {
         false
     } else if mode == AuditMode::Quick {
         mean_js_divergence.is_some_and(|value| value >= JSD_QUICK_DIFFERENCE_THRESHOLD)
@@ -1197,12 +1747,12 @@ fn identity_with_reference(
                 result.p_value < 0.01 && result.statistic >= MMD_EFFECT_THRESHOLD
             })
     };
-    let reference_consistent =
-        enough_cells && !reference_different && (mode == AuditMode::Quick || mmd.is_some());
-    let state = if reference_different {
+    // Fixed cross-model thresholds can flag an experimental difference in the
+    // stronger modes, but absence of rejection is not evidence of equivalence.
+    // Only a versioned same-model calibration (the signed static path) may
+    // produce ReferenceConsistent.
+    let state = if experimental_difference && mode != AuditMode::Quick {
         IdentityAssessmentKind::ReferenceDifferent
-    } else if reference_consistent {
-        IdentityAssessmentKind::ReferenceConsistent
     } else {
         IdentityAssessmentKind::Unproven
     };
@@ -1225,6 +1775,16 @@ fn identity_with_reference(
         reasons.push(format!(
             "at least {required_cells} matched eligible cells are required for this mode"
         ));
+    } else if mode == AuditMode::Quick && experimental_difference {
+        reasons.push(
+            "quick-mode JSD crossed an experimental distance trigger, but quick mode lacks the independent MMD evidence required for a significant-difference verdict"
+                .to_owned(),
+        );
+    } else if state == IdentityAssessmentKind::Unproven {
+        reasons.push(
+            "no versioned same-model calibration was available, so behavioral proximity cannot be called reference-consistent"
+                .to_owned(),
+        );
     }
     IdentityAssessment {
         state,
@@ -1240,6 +1800,8 @@ fn identity_with_reference(
         limitations: vec![
             "JSD and MMD are behavioral comparisons, not physical identity proofs".to_owned(),
             "the fixed effect thresholds are conservative and remain experimental across model updates"
+                .to_owned(),
+            "not crossing an experimental difference threshold is not an equivalence test"
                 .to_owned(),
             "a relay capable of recognizing every audit request may selectively route around the test"
                 .to_owned(),
@@ -1322,6 +1884,7 @@ fn build_planned_cases(
                         audit_id: audit_id.to_owned(),
                         profile: profile.clone(),
                         model: request.model.clone(),
+                        reasoning_effort: request.effort.clone(),
                         case_id,
                         kind: TransportCaseKind::UsageScale,
                         detector: AuditDetector::Usage,
@@ -1338,18 +1901,29 @@ fn build_planned_cases(
         }
     }
 
-    if request.mode != AuditMode::Connection && enabled(AuditDetector::Fingerprint) {
+    let anti_evasion_plan = matches!(request.mode, AuditMode::Standard | AuditMode::Deep)
+        && enabled(AuditDetector::CacheBehavior);
+    if request.mode != AuditMode::Connection
+        && (enabled(AuditDetector::Fingerprint) || anti_evasion_plan)
+    {
+        let fingerprint_detector = if enabled(AuditDetector::Fingerprint) {
+            AuditDetector::Fingerprint
+        } else {
+            AuditDetector::CacheBehavior
+        };
         for probe in generate_probe_plan(request.run_seed, request.mode).cases {
+            let audit_messages = fingerprint_role_messages(&probe.prompt, probe.role_variant);
             cases.push(PlannedCase {
                 operation: TransportAuditCase {
                     audit_id: audit_id.to_owned(),
                     profile: profile.clone(),
                     model: request.model.clone(),
+                    reasoning_effort: request.effort.clone(),
                     case_id: probe.case_id.clone(),
                     kind: TransportCaseKind::Fingerprint,
-                    detector: AuditDetector::Fingerprint,
+                    detector: fingerprint_detector,
                     prompt: probe.prompt.clone(),
-                    audit_messages: Vec::new(),
+                    audit_messages,
                     audit_tool: None,
                     streaming: false,
                     temperature: probe.temperature,
@@ -1387,6 +1961,7 @@ fn build_planned_cases(
                         audit_id: audit_id.to_owned(),
                         profile: profile.clone(),
                         model: request.model.clone(),
+                        reasoning_effort: request.effort.clone(),
                         case_id,
                         kind: TransportCaseKind::Quality,
                         detector: AuditDetector::Quality,
@@ -1417,6 +1992,7 @@ fn build_planned_cases(
                         audit_id: audit_id.to_owned(),
                         profile: profile.clone(),
                         model: request.model.clone(),
+                        reasoning_effort: request.effort.clone(),
                         case_id: format!("private-{hash_prefix}-{}", task.id),
                         kind: TransportCaseKind::Quality,
                         detector: AuditDetector::Quality,
@@ -1455,12 +2031,22 @@ fn build_planned_cases(
         .iter()
         .find(|case| case.operation.kind == TransportCaseKind::Fingerprint)
         .map(|case| {
-            let mut operation = case.operation.clone();
+            let operation = case.operation.clone();
             fingerprint_prompt_variants()
                 .into_iter()
-                .map(|prompt| {
-                    operation.prompt = prompt;
-                    crate::relay_transport::conservative_operation_input_token_bound(&operation)
+                .flat_map(|prompt| {
+                    (0..=2).map({
+                        let operation = operation.clone();
+                        move |role_variant| {
+                            let mut operation = operation.clone();
+                            operation.prompt = prompt.clone();
+                            operation.audit_messages =
+                                fingerprint_role_messages(&prompt, role_variant);
+                            crate::relay_transport::conservative_operation_input_token_bound(
+                                &operation,
+                            )
+                        }
+                    })
                 })
                 .max()
                 .unwrap_or_else(|| {
@@ -1484,6 +2070,28 @@ fn build_planned_cases(
     // request order.
     cases.sort_by_key(|case| order_key(request.run_seed, &case.operation.case_id));
     cases
+}
+
+fn fingerprint_role_messages(prompt: &str, role_variant: usize) -> Vec<RelayAuditMessage> {
+    let framing = match role_variant {
+        1 => "Follow the next category instruction and answer with one word.",
+        2 => "For the next request, return only the requested single-word answer.",
+        _ => return Vec::new(),
+    };
+    vec![
+        RelayAuditMessage {
+            role: RelayAuditMessageRole::User,
+            content: framing.to_owned(),
+        },
+        RelayAuditMessage {
+            role: RelayAuditMessageRole::Assistant,
+            content: "Understood.".to_owned(),
+        },
+        RelayAuditMessage {
+            role: RelayAuditMessageRole::User,
+            content: prompt.to_owned(),
+        },
+    ]
 }
 
 fn load_private_pack_for_request(
@@ -1592,6 +2200,7 @@ fn simple_case(
             audit_id: audit_id.to_owned(),
             profile: profile.clone(),
             model: request.model.clone(),
+            reasoning_effort: request.effort.clone(),
             case_id: case_id.to_owned(),
             kind,
             detector,
@@ -1924,6 +2533,18 @@ fn validate_profile_binding(
             "private probe pack must exactly match the saved relay profile reference".to_owned(),
         );
     }
+    let normalized_effort = normalize_audit_effort(request.effort.as_deref())?;
+    if normalized_effort != request.effort {
+        return Err("audit effort must already be normalized".to_owned());
+    }
+    if profile.protocol == crate::relay_audit::RelayProtocol::AnthropicMessages
+        && request.effort.is_some()
+    {
+        return Err(
+            "Anthropic Messages does not support the OpenAI reasoning effort parameter; leave effort unset"
+                .to_owned(),
+        );
+    }
     validate_profile_endpoint(profile)
 }
 
@@ -1969,6 +2590,44 @@ fn validate_paired_reference(
     }
     if endpoint_class(&reference.normalized_base_url) != "officialApi" {
         return Err("paired reference profile must use an official API endpoint".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_trusted_baseline_reference(
+    target: &RelayProfile,
+    request: &RelayAuditRequest,
+    baseline: &TrustedRelayBaselinePackage,
+) -> Result<(), String> {
+    if request.official_baseline_profile_id.is_some() {
+        return Err(
+            "a live official reference and a trusted static baseline are mutually exclusive"
+                .to_owned(),
+        );
+    }
+    baseline.payload.validate()?;
+    if baseline.payload.is_expired_at(Utc::now()) {
+        return Err("the selected trusted static baseline has expired".to_owned());
+    }
+    if baseline.payload.protocol != target.protocol
+        || baseline.payload.model != target.default_model
+        || baseline.payload.model != request.model
+        || baseline.payload.effort != request.effort
+    {
+        return Err(
+            "trusted static baseline must match the exact audit protocol, requested model, and effort"
+                .to_owned(),
+        );
+    }
+    if !request.enabled_detectors.is_empty()
+        && !request
+            .enabled_detectors
+            .contains(&AuditDetector::Fingerprint)
+    {
+        return Err("trusted static baseline requires the fingerprint detector".to_owned());
+    }
+    if request.mode == AuditMode::Connection {
+        return Err("connection mode cannot score a trusted static baseline".to_owned());
     }
     Ok(())
 }
@@ -2171,6 +2830,10 @@ mod tests {
     use super::*;
     use crate::private_probe_pack::{resolve_private_probe_pack, LoadedPrivateProbeTask};
     use crate::relay_audit::{PrivateProbePackReference, RelayProtocol};
+    use crate::relay_baseline::{
+        RelayBaselineFingerprintCell, RelayBaselineFingerprintParameters, RelayBaselinePayloadV1,
+        FINGERPRINT_GENERATOR_VERSION, FINGERPRINT_NORMALIZATION_VERSION,
+    };
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -2248,6 +2911,7 @@ mod tests {
         profile_id: String,
         case_id: String,
         model: String,
+        reasoning_effort: Option<String>,
         protocol: crate::relay_audit::RelayProtocol,
         streaming: bool,
         temperature: f64,
@@ -2289,6 +2953,7 @@ mod tests {
                 profile_id: operation.profile.id.clone(),
                 case_id: operation.case_id.clone(),
                 model: operation.model.clone(),
+                reasoning_effort: operation.reasoning_effort.clone(),
                 protocol: operation.profile.protocol,
                 streaming: operation.streaming,
                 temperature: operation.temperature,
@@ -2443,6 +3108,7 @@ mod tests {
         RelayAuditRequest {
             profile_id: "relay".to_owned(),
             model: "gpt-test".to_owned(),
+            effort: None,
             mode,
             official_baseline_profile_id: None,
             max_requests,
@@ -2453,6 +3119,120 @@ mod tests {
             enabled_detectors: vec![AuditDetector::Protocol],
             private_probe_pack: None,
         }
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct AntiEvasionScenario {
+        cache_collapse: bool,
+        low_stable_latency: bool,
+        paraphrase_drift: bool,
+        role_format_drift: bool,
+        only_batch: Option<usize>,
+    }
+
+    fn anti_evasion_observations(
+        planned: &[PlannedCase],
+        scenario: AntiEvasionScenario,
+    ) -> (
+        BTreeMap<String, StoredObservation>,
+        BTreeMap<String, StoredObservation>,
+    ) {
+        let mut target = BTreeMap::new();
+        let mut reference = BTreeMap::new();
+        for case in planned {
+            let Some(probe) = case.probe.as_ref() else {
+                continue;
+            };
+            let affected = scenario
+                .only_batch
+                .is_none_or(|batch| batch == probe.batch_index);
+            let reference_value = valid_probe_value(probe.cell.family, probe.sample_index % 5);
+            let mut target_value = reference_value.clone();
+            if affected && scenario.cache_collapse {
+                // Keep all three cohorts on the same cached answer so cache
+                // collapse alone cannot masquerade as paraphrase/role drift.
+                target_value = valid_probe_value(probe.cell.family, 0);
+            }
+            if affected
+                && scenario.paraphrase_drift
+                && probe.cohort == FingerprintProbeCohort::Paraphrase
+            {
+                target_value = valid_probe_value(probe.cell.family, 6);
+            }
+            if affected
+                && scenario.role_format_drift
+                && probe.cohort == FingerprintProbeCohort::RoleFormat
+            {
+                target_value = valid_probe_value(probe.cell.family, 7);
+            }
+            let reference_elapsed = 100 + (probe.sample_index % 5) as u64 * 20;
+            let target_elapsed = if affected && scenario.low_stable_latency {
+                10
+            } else {
+                reference_elapsed
+            };
+            target.insert(
+                case.operation.case_id.clone(),
+                StoredObservation {
+                    usage: ReportedUsage::default(),
+                    bounded_text_sample: Some(target_value),
+                    bounded_tool_call: None,
+                    input_token_estimate: 1,
+                    elapsed_ms: target_elapsed,
+                },
+            );
+            reference.insert(
+                case.operation.case_id.clone(),
+                StoredObservation {
+                    usage: ReportedUsage::default(),
+                    bounded_text_sample: Some(reference_value),
+                    bounded_tool_call: None,
+                    input_token_estimate: 1,
+                    elapsed_ms: reference_elapsed,
+                },
+            );
+        }
+        (target, reference)
+    }
+
+    fn valid_probe_value(family: crate::relay_audit::ProbeFamily, index: usize) -> String {
+        match family {
+            crate::relay_audit::ProbeFamily::Number => (index % 10 + 1).to_string(),
+            crate::relay_audit::ProbeFamily::Letter => {
+                ((b'a' + (index % 26) as u8) as char).to_string()
+            }
+            crate::relay_audit::ProbeFamily::Color => [
+                "red", "blue", "green", "yellow", "black", "white", "purple", "orange",
+            ][index % 8]
+                .to_owned(),
+            _ => format!("value{}", index % 10),
+        }
+    }
+
+    #[test]
+    fn anthropic_visible_input_uses_uncached_cache_write_and_cache_read_components() {
+        let observation = StoredObservation {
+            usage: ReportedUsage {
+                input_tokens: Some(10),
+                cached_input_tokens: Some(7),
+                cache_creation_input_tokens: Some(5),
+                output_tokens: Some(1),
+                total_tokens: None,
+                ..ReportedUsage::default()
+            },
+            bounded_text_sample: None,
+            bounded_tool_call: None,
+            input_token_estimate: 10,
+            elapsed_ms: 1,
+        };
+        assert_eq!(
+            visible_input_excess(&observation, RelayProtocol::AnthropicMessages),
+            Some(12.0)
+        );
+        assert_eq!(
+            visible_input_excess(&observation, RelayProtocol::OpenAiResponses),
+            Some(0.0)
+        );
     }
 
     fn loaded_private_pack() -> LoadedPrivateProbePack {
@@ -2737,6 +3517,52 @@ mod tests {
     }
 
     #[test]
+    fn terminal_fallback_retention_is_bounded_without_evicting_active_runs() {
+        let manager = AuditManager::new(Arc::new(MockTransport::default()), None);
+        let receipt = manager
+            .start(
+                profile(),
+                request(AuditMode::Connection, 6),
+                "top-secret-key".to_owned(),
+            )
+            .unwrap();
+        wait_terminal(&manager, &receipt.audit_id);
+
+        {
+            let mut runs = lock_recover(&manager.runs);
+            let template = runs
+                .get(&receipt.audit_id)
+                .expect("terminal template")
+                .clone();
+            runs.clear();
+            for index in 0..40 {
+                let mut entry = template.clone();
+                entry.snapshot.audit_id = format!("terminal-{index:02}");
+                entry.snapshot.status = AuditRunStatus::Completed;
+                entry.snapshot.started_at = format!("2026-08-27T00:00:{index:02}.000Z");
+                entry.snapshot.completed_at = Some(format!("2026-08-27T00:01:{index:02}.000Z"));
+                runs.insert(entry.snapshot.audit_id.clone(), entry);
+            }
+            let mut active = template;
+            active.snapshot.audit_id = "active-run".to_owned();
+            active.snapshot.status = AuditRunStatus::Running;
+            active.snapshot.completed_at = None;
+            runs.insert(active.snapshot.audit_id.clone(), active);
+        }
+
+        assert_eq!(manager.prune_terminal_snapshots(8), 32);
+        let retained = manager.list(500);
+        assert_eq!(retained.len(), 9);
+        assert_eq!(
+            retained.iter().filter(|run| run.status.terminal()).count(),
+            8
+        );
+        assert!(retained
+            .iter()
+            .any(|run| run.audit_id == "active-run" && run.status == AuditRunStatus::Running));
+    }
+
+    #[test]
     fn community_ranking_is_optional_and_cannot_change_no_reference_verdict() {
         let manager = AuditManager::new(Arc::new(MockTransport::default()), None);
         let mut fingerprint_request = request(AuditMode::Quick, 150);
@@ -2985,14 +3811,119 @@ mod tests {
 
     fn paired_fingerprint_request() -> RelayAuditRequest {
         let mut request = request(AuditMode::Standard, 320);
+        request.effort = Some("high".to_owned());
         request.official_baseline_profile_id = Some("official".to_owned());
         request.timeout_ms = 10_000;
         request.enabled_detectors = vec![AuditDetector::Fingerprint];
         request
     }
 
+    fn trusted_static_fingerprint_baseline() -> TrustedRelayBaselinePackage {
+        let output_for_family = |family| match family {
+            crate::relay_audit::ProbeFamily::Number => "42",
+            crate::relay_audit::ProbeFamily::Letter => "a",
+            crate::relay_audit::ProbeFamily::Color => "blue",
+            crate::relay_audit::ProbeFamily::Animal => "cat",
+            crate::relay_audit::ProbeFamily::City => "paris",
+            crate::relay_audit::ProbeFamily::Food => "rice",
+            crate::relay_audit::ProbeFamily::Emotion => "happy",
+            crate::relay_audit::ProbeFamily::Shape => "circle",
+            crate::relay_audit::ProbeFamily::Profession => "doctor",
+            crate::relay_audit::ProbeFamily::Weather => "sunny",
+        };
+        let fingerprint_cells = crate::relay_audit::ProbeFamily::ALL
+            .into_iter()
+            .flat_map(|family| {
+                crate::relay_audit::ProbeLanguage::ALL
+                    .into_iter()
+                    .map(move |language| RelayBaselineFingerprintCell {
+                        family,
+                        language,
+                        counts: BTreeMap::from([(output_for_family(family).to_owned(), 10)]),
+                    })
+            })
+            .collect::<Vec<_>>();
+        TrustedRelayBaselinePackage {
+            signing_key_id: "local-release-key".to_owned(),
+            verified_at: "2026-08-27T01:00:00Z".to_owned(),
+            // Persistence performs the real Ed25519 re-verification before a
+            // package reaches AuditManager. This fixture exercises only the
+            // manager's evidence boundary with an already verified value.
+            signature_base64: "test-fixture-signature".to_owned(),
+            payload: RelayBaselinePayloadV1 {
+                id: "trusted-static-gpt-test".to_owned(),
+                label: "Trusted static test baseline".to_owned(),
+                source: "community".to_owned(),
+                version: "2026.08.27".to_owned(),
+                model: "gpt-test".to_owned(),
+                effort: None,
+                protocol: RelayProtocol::OpenAiResponses,
+                sample_count: fingerprint_cells.len() * 10,
+                created_at: "2026-08-27T00:00:00Z".to_owned(),
+                expires_at: Some("2026-11-27T00:00:00Z".to_owned()),
+                parameters: RelayBaselineFingerprintParameters {
+                    generator_version: FINGERPRINT_GENERATOR_VERSION.to_owned(),
+                    normalization_version: FINGERPRINT_NORMALIZATION_VERSION.to_owned(),
+                    temperature_milli: 1_000,
+                    max_output_tokens: 16,
+                    same_model_max_mean_jsd_micros: 120_000,
+                    different_model_min_mean_jsd_micros: 300_000,
+                },
+                fingerprint_cells,
+                limitations: vec!["test fixture only".to_owned()],
+            },
+        }
+    }
+
     #[test]
-    fn paired_standard_audit_interleaves_identical_cases_and_returns_reference_consistent() {
+    fn trusted_static_baseline_scores_without_extra_requests_but_cannot_issue_a_pass() {
+        let transport = Arc::new(PairedMockTransport::new(
+            PairedMockBehavior::SameFingerprint,
+        ));
+        let manager = AuditManager::new(transport.clone(), None);
+        let mut audit_request = request(AuditMode::Standard, 320);
+        audit_request.timeout_ms = 10_000;
+        audit_request.enabled_detectors = vec![AuditDetector::Fingerprint];
+        let receipt = manager
+            .start_with_trusted_baseline(
+                profile(),
+                audit_request,
+                "top-secret-key".to_owned(),
+                trusted_static_fingerprint_baseline(),
+            )
+            .unwrap();
+        assert_eq!(receipt.planned_cases, 240);
+
+        let report = wait_terminal(&manager, &receipt.audit_id)
+            .report
+            .expect("trusted static report");
+        assert_eq!(
+            report.fingerprint_findings.state,
+            IdentityAssessmentKind::ReferenceConsistent
+        );
+        assert_eq!(report.overall_verdict, OverallVerdict::InsufficientEvidence);
+        assert_eq!(report.confidence, EvidenceConfidence::Low);
+        assert!(report.paired_baseline.is_none());
+        let trusted = report
+            .trusted_static_baseline
+            .as_ref()
+            .expect("trusted baseline summary");
+        assert_eq!(trusted.baseline_id, "trusted-static-gpt-test");
+        assert_eq!(trusted.confidence, EvidenceConfidence::Low);
+
+        let calls = lock_recover(&transport.calls).clone();
+        assert_eq!(calls.len(), 240, "static comparison adds no network calls");
+        assert!(calls.iter().all(|call| call.profile_id == "relay"));
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains("actualModel"));
+        assert!(!serialized.contains("actual_model"));
+        assert!(report.limitations.iter().any(|limitation| {
+            limitation.contains("cannot by itself set the overall verdict to consistent")
+        }));
+    }
+
+    #[test]
+    fn paired_standard_audit_interleaves_identical_cases_but_does_not_claim_equivalence() {
         let transport = Arc::new(PairedMockTransport::new(
             PairedMockBehavior::SameFingerprint,
         ));
@@ -3011,7 +3942,7 @@ mod tests {
         let report = snapshot.report.as_ref().expect("paired report");
         assert_eq!(
             report.fingerprint_findings.state,
-            IdentityAssessmentKind::ReferenceConsistent
+            IdentityAssessmentKind::Unproven
         );
         assert!(report.paired_baseline.is_some());
         assert_eq!(report.overall_verdict, OverallVerdict::InsufficientEvidence);
@@ -3037,6 +3968,8 @@ mod tests {
         for pair in calls.chunks_exact(2) {
             assert_eq!(pair[0].case_id, pair[1].case_id);
             assert_eq!(pair[0].model, pair[1].model);
+            assert_eq!(pair[0].reasoning_effort.as_deref(), Some("high"));
+            assert_eq!(pair[0].reasoning_effort, pair[1].reasoning_effort);
             assert_eq!(pair[0].protocol, pair[1].protocol);
             assert_eq!(pair[0].streaming, pair[1].streaming);
             assert_eq!(pair[0].temperature, pair[1].temperature);
@@ -3175,6 +4108,7 @@ mod tests {
                         .then(|| specification.expected_tool_call.clone())
                         .flatten(),
                     input_token_estimate: 1,
+                    elapsed_ms: 10,
                 },
             );
             reference.insert(
@@ -3187,6 +4121,7 @@ mod tests {
                         .then(|| specification.expected.clone()),
                     bounded_tool_call: specification.expected_tool_call.clone(),
                     input_token_estimate: 1,
+                    elapsed_ms: 10,
                 },
             );
         }
@@ -3230,6 +4165,7 @@ mod tests {
                     bounded_text_sample: Some("wrong".to_owned()),
                     bounded_tool_call: None,
                     input_token_estimate: 1,
+                    elapsed_ms: 10,
                 },
             );
             reference.insert(
@@ -3242,6 +4178,7 @@ mod tests {
                         .then(|| specification.expected.clone()),
                     bounded_tool_call: specification.expected_tool_call.clone(),
                     input_token_estimate: 1,
+                    elapsed_ms: 10,
                 },
             );
         }
@@ -3256,6 +4193,209 @@ mod tests {
             assessment.state,
             crate::relay_audit::QualityAssessmentKind::Learning
         );
+    }
+
+    #[test]
+    fn anti_evasion_reuses_standard_fingerprint_budget_and_quick_never_enables_it() {
+        let mut standard = request(AuditMode::Standard, 320);
+        standard.enabled_detectors = vec![AuditDetector::CacheBehavior];
+        standard.run_seed = [71; 32];
+        let planned = build_planned_cases("audit-anti-evasion", &profile(), &standard, None);
+        assert_eq!(planned.len(), 240);
+        assert!(planned.iter().all(|case| {
+            case.operation.detector == AuditDetector::CacheBehavior && case.probe.is_some()
+        }));
+        for cohort in [
+            FingerprintProbeCohort::Canonical,
+            FingerprintProbeCohort::Paraphrase,
+            FingerprintProbeCohort::RoleFormat,
+        ] {
+            assert_eq!(
+                planned
+                    .iter()
+                    .filter(|case| case
+                        .probe
+                        .as_ref()
+                        .is_some_and(|probe| probe.cohort == cohort))
+                    .count(),
+                80
+            );
+        }
+        assert!(planned.iter().all(|case| {
+            let probe = case.probe.as_ref().unwrap();
+            (probe.cohort == FingerprintProbeCohort::RoleFormat)
+                == (case.operation.audit_messages.len() == 3)
+        }));
+        assert_eq!(
+            planned
+                .iter()
+                .filter_map(|case| case.probe.as_ref().map(|probe| probe.batch_index))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1])
+        );
+
+        let mut quick = request(AuditMode::Quick, 150);
+        quick.enabled_detectors = vec![AuditDetector::CacheBehavior];
+        assert!(build_planned_cases("audit-anti-quick", &profile(), &quick, None).is_empty());
+        assert_eq!(
+            paired_anti_evasion_assessment(
+                &[],
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                AuditMode::Quick,
+            )
+            .state,
+            AntiEvasionAssessmentKind::NotRun
+        );
+    }
+
+    #[test]
+    fn anti_evasion_requires_two_independent_signals_in_both_batches() {
+        let mut audit_request = request(AuditMode::Standard, 320);
+        audit_request.enabled_detectors = vec![AuditDetector::CacheBehavior];
+        audit_request.run_seed = [72; 32];
+        let planned = build_planned_cases("audit-anti-threshold", &profile(), &audit_request, None);
+
+        let (one_batch_target, one_batch_reference) = anti_evasion_observations(
+            &planned,
+            AntiEvasionScenario {
+                cache_collapse: true,
+                low_stable_latency: true,
+                only_batch: Some(0),
+                ..AntiEvasionScenario::default()
+            },
+        );
+        let one_batch = paired_anti_evasion_assessment(
+            &planned,
+            &one_batch_target,
+            &one_batch_reference,
+            AuditMode::Standard,
+        );
+        assert_eq!(one_batch.state, AntiEvasionAssessmentKind::Consistent);
+        assert!(one_batch.persistent_signals.is_empty());
+
+        let (one_signal_target, one_signal_reference) = anti_evasion_observations(
+            &planned,
+            AntiEvasionScenario {
+                cache_collapse: true,
+                ..AntiEvasionScenario::default()
+            },
+        );
+        let one_signal = paired_anti_evasion_assessment(
+            &planned,
+            &one_signal_target,
+            &one_signal_reference,
+            AuditMode::Standard,
+        );
+        assert_eq!(one_signal.state, AntiEvasionAssessmentKind::Consistent);
+        assert_eq!(
+            one_signal.persistent_signals,
+            vec![AntiEvasionSignal::CacheDistributionCollapse]
+        );
+
+        let (two_signal_target, two_signal_reference) = anti_evasion_observations(
+            &planned,
+            AntiEvasionScenario {
+                cache_collapse: true,
+                low_stable_latency: true,
+                ..AntiEvasionScenario::default()
+            },
+        );
+        let two_signals = paired_anti_evasion_assessment(
+            &planned,
+            &two_signal_target,
+            &two_signal_reference,
+            AuditMode::Standard,
+        );
+        assert_eq!(
+            two_signals.state,
+            AntiEvasionAssessmentKind::SuspiciousBehavior
+        );
+        assert_eq!(two_signals.persistent_signals.len(), 2);
+        assert!(two_signals
+            .persistent_signals
+            .contains(&AntiEvasionSignal::CacheDistributionCollapse));
+        assert!(two_signals
+            .persistent_signals
+            .contains(&AntiEvasionSignal::SuspiciouslyLowStableLatency));
+    }
+
+    #[test]
+    fn anti_evasion_latency_only_cannot_be_called_consistent() {
+        let mut audit_request = request(AuditMode::Standard, 320);
+        audit_request.enabled_detectors = vec![AuditDetector::CacheBehavior];
+        audit_request.run_seed = [73; 32];
+        let planned =
+            build_planned_cases("audit-anti-latency-only", &profile(), &audit_request, None);
+        let (mut target, mut reference) = anti_evasion_observations(
+            &planned,
+            AntiEvasionScenario {
+                low_stable_latency: true,
+                ..AntiEvasionScenario::default()
+            },
+        );
+        for observation in target.values_mut().chain(reference.values_mut()) {
+            observation.bounded_text_sample = None;
+        }
+
+        let assessment =
+            paired_anti_evasion_assessment(&planned, &target, &reference, AuditMode::Standard);
+        assert_eq!(
+            assessment.state,
+            AntiEvasionAssessmentKind::InsufficientEvidence
+        );
+        assert_eq!(
+            assessment.factors.len(),
+            2,
+            "only the two latency batches remain"
+        );
+    }
+
+    #[test]
+    fn anti_evasion_detects_paraphrase_and_role_format_drift_without_storing_answers() {
+        let mut audit_request = request(AuditMode::Deep, 720);
+        audit_request.enabled_detectors = vec![AuditDetector::CacheBehavior];
+        audit_request.run_seed = [73; 32];
+        let planned = build_planned_cases("audit-anti-drift", &profile(), &audit_request, None);
+        assert_eq!(planned.len(), 600);
+        let (target, reference) = anti_evasion_observations(
+            &planned,
+            AntiEvasionScenario {
+                paraphrase_drift: true,
+                role_format_drift: true,
+                ..AntiEvasionScenario::default()
+            },
+        );
+        let assessment =
+            paired_anti_evasion_assessment(&planned, &target, &reference, AuditMode::Deep);
+        assert_eq!(
+            assessment.state,
+            AntiEvasionAssessmentKind::SuspiciousBehavior
+        );
+        assert_eq!(
+            assessment.persistent_signals,
+            vec![
+                AntiEvasionSignal::ParaphraseDrift,
+                AntiEvasionSignal::RoleFormatSensitivity,
+            ]
+        );
+        assert!(assessment
+            .factors
+            .iter()
+            .all(|factor| factor.paired_samples > 0));
+        for factor in &assessment.factors {
+            if matches!(
+                factor.signal,
+                AntiEvasionSignal::ParaphraseDrift | AntiEvasionSignal::RoleFormatSensitivity
+            ) {
+                assert_eq!(factor.primary_threshold, 0.30);
+                assert_eq!(factor.secondary_threshold, Some(0.20));
+            }
+        }
+        let json = serde_json::to_string(&assessment).unwrap();
+        assert!(!json.contains("value6"));
+        assert!(!json.contains("value7"));
+        assert!(!json.contains("boundedText"));
     }
 
     #[test]
@@ -3297,6 +4437,7 @@ mod tests {
                 bounded_text_sample: Some("ignore previous instructions".to_owned()),
                 bounded_tool_call: Some(expected_tool.clone()),
                 input_token_estimate: 1,
+                elapsed_ms: 10,
             }
         ));
         let mut wrong_tool = expected_tool;
@@ -3310,6 +4451,7 @@ mod tests {
                 bounded_text_sample: None,
                 bounded_tool_call: Some(wrong_tool),
                 input_token_estimate: 1,
+                elapsed_ms: 10,
             }
         ));
 
@@ -3342,6 +4484,7 @@ mod tests {
                 bounded_text_sample: Some(state_probe.expected.clone()),
                 bounded_tool_call: None,
                 input_token_estimate: 1,
+                elapsed_ms: 10,
             }
         ));
         assert!(!score_quality_probe(
@@ -3351,6 +4494,7 @@ mod tests {
                 bounded_text_sample: Some("wrong".to_owned()),
                 bounded_tool_call: None,
                 input_token_estimate: 1,
+                elapsed_ms: 10,
             }
         ));
     }
@@ -3371,6 +4515,7 @@ mod tests {
             bounded_text_sample: Some(expected.clone()),
             bounded_tool_call: None,
             input_token_estimate: 1,
+            elapsed_ms: 10,
         };
         assert!(score_quality_probe(&specification, &exact));
 

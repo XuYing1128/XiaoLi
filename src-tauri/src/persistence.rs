@@ -1,10 +1,11 @@
 use crate::{
     history::{ConversationHistoryFilter, ConversationHistoryRecord},
-    model::{BehaviorSampleV2, CompletedTurnSample},
+    model::{BehaviorSampleV2, CompletedTurnSample, MonitorSnapshot},
     relay_audit::{RelayAuditReportV1, RelayProfile},
-    relay_baseline::RelayBaselineSummary,
+    relay_baseline::{RelayBaselineSummary, RelayBaselineTrustAnchor, TrustedRelayBaselinePackage},
 };
 use atomicwrites::{AllowOverwrite, AtomicFile};
+use chrono::DateTime;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
@@ -141,6 +142,21 @@ impl Persistence {
                    imported_at TEXT NOT NULL,
                    expires_at TEXT,
                    json TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS relay_baseline_trust_anchors (
+                   key_id TEXT PRIMARY KEY,
+                   label TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   json TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS trusted_relay_baseline_packages (
+                   id TEXT PRIMARY KEY,
+                   signing_key_id TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   protocol TEXT NOT NULL,
+                   expires_at TEXT,
+                   json TEXT NOT NULL,
+                   FOREIGN KEY(signing_key_id) REFERENCES relay_baseline_trust_anchors(key_id)
                  );",
             )
             .map_err(|error| error.to_string())?;
@@ -160,12 +176,13 @@ impl Persistence {
         self.root.join("latest-snapshot.json")
     }
 
-    pub fn save_snapshot<T: Serialize>(
+    pub fn save_snapshot(
         &self,
-        snapshot: &T,
+        snapshot: &MonitorSnapshot,
         checked_at: &str,
     ) -> Result<String, String> {
-        let json = serde_json::to_string(snapshot).map_err(|error| error.to_string())?;
+        let redacted = snapshot.redacted_for_persistence();
+        let json = serde_json::to_string(&redacted).map_err(|error| error.to_string())?;
         {
             let connection = self
                 .connection
@@ -1150,10 +1167,370 @@ impl Persistence {
     }
 
     pub fn list_relay_baselines(&self) -> Result<Vec<RelayBaselineSummary>, String> {
-        self.query_json_rows(
+        let mut baselines: Vec<RelayBaselineSummary> = self.query_json_rows(
             "SELECT json FROM relay_baselines ORDER BY imported_at DESC",
             [],
+        )?;
+        for baseline in &mut baselines {
+            if !baseline.signature_verified {
+                continue;
+            }
+            match self.get_trusted_relay_baseline_package(&baseline.id)? {
+                Some(package) => *baseline = package.summary(),
+                None => {
+                    baseline.signature_verified = false;
+                    baseline.usable_for_scoring = false;
+                    baseline.scoring_mode = None;
+                    baseline.limitations.push(
+                        "the previously verified package no longer has a valid local trust anchor"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        Ok(baselines)
+    }
+
+    pub fn upsert_relay_baseline_trust_anchor(
+        &self,
+        anchor: &RelayBaselineTrustAnchor,
+    ) -> Result<(), String> {
+        anchor.validate()?;
+        let json = serde_json::to_string(anchor).map_err(|error| error.to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        if let Some(existing_json) = connection
+            .query_row(
+                "SELECT json FROM relay_baseline_trust_anchors WHERE key_id=?1",
+                params![&anchor.key_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        {
+            let existing: RelayBaselineTrustAnchor =
+                serde_json::from_str(&existing_json).map_err(|error| error.to_string())?;
+            if existing.public_key_base64 != anchor.public_key_base64 {
+                return Err(
+                    "a different public key already uses this keyId; delete it explicitly before replacement"
+                        .to_owned(),
+                );
+            }
+        }
+        connection
+            .execute(
+                "INSERT INTO relay_baseline_trust_anchors(key_id, label, created_at, json)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(key_id) DO UPDATE SET
+                   label=excluded.label,
+                   created_at=excluded.created_at,
+                   json=excluded.json",
+                params![&anchor.key_id, &anchor.label, &anchor.created_at, json],
+            )
+            .map_err(|error| error.to_string())?;
+        secure_database_sidecars(&self.root)?;
+        Ok(())
+    }
+
+    pub fn get_relay_baseline_trust_anchor(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<RelayBaselineTrustAnchor>, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        let json = connection
+            .query_row(
+                "SELECT json FROM relay_baseline_trust_anchors WHERE key_id=?1",
+                params![key_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        json.map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    pub fn list_relay_baseline_trust_anchors(
+        &self,
+    ) -> Result<Vec<RelayBaselineTrustAnchor>, String> {
+        self.query_json_rows(
+            "SELECT json FROM relay_baseline_trust_anchors ORDER BY created_at DESC, key_id",
+            [],
         )
+    }
+
+    pub fn delete_relay_baseline_trust_anchor(&self, key_id: &str) -> Result<usize, String> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let package_ids = {
+            let mut statement = transaction
+                .prepare("SELECT id FROM trusted_relay_baseline_packages WHERE signing_key_id=?1")
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(params![key_id], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        for baseline_id in &package_ids {
+            transaction
+                .execute(
+                    "DELETE FROM relay_baselines WHERE id=?1 AND source='community'",
+                    params![baseline_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM trusted_relay_baseline_packages WHERE signing_key_id=?1",
+                params![key_id],
+            )
+            .map_err(|error| error.to_string())?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM relay_baseline_trust_anchors WHERE key_id=?1",
+                params![key_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        secure_database_sidecars(&self.root)?;
+        Ok(if deleted > 0 { package_ids.len() } else { 0 })
+    }
+
+    pub fn upsert_trusted_relay_baseline_package(
+        &self,
+        package: &TrustedRelayBaselinePackage,
+    ) -> Result<(), String> {
+        package.payload.validate_signed_structure()?;
+        let summary = package.summary();
+        let package_json = serde_json::to_string(package).map_err(|error| error.to_string())?;
+        let summary_json = serde_json::to_string(&summary).map_err(|error| error.to_string())?;
+        let protocol =
+            serde_json::to_string(&package.payload.protocol).map_err(|error| error.to_string())?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let anchor_json = transaction
+            .query_row(
+                "SELECT json FROM relay_baseline_trust_anchors WHERE key_id=?1",
+                params![&package.signing_key_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "trusted baseline signing key is not in the local trust store".to_owned()
+            })?;
+        let anchor: RelayBaselineTrustAnchor =
+            serde_json::from_str(&anchor_json).map_err(|error| error.to_string())?;
+        package.reverify(&anchor)?;
+        if let Some((existing_signer, existing_json)) = transaction
+            .query_row(
+                "SELECT signing_key_id, json FROM trusted_relay_baseline_packages WHERE id=?1",
+                params![&package.payload.id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        {
+            if existing_signer != package.signing_key_id {
+                return Err(
+                    "a different trusted signer already owns this baseline id; delete it explicitly before replacement"
+                        .to_owned(),
+                );
+            }
+            let existing: TrustedRelayBaselinePackage =
+                serde_json::from_str(&existing_json).map_err(|error| error.to_string())?;
+            // `verifiedAt` is local import metadata, not signed package
+            // content. Re-importing the exact same signed payload is
+            // idempotent and preserves the original verification record.
+            if existing.signing_key_id == package.signing_key_id
+                && existing.signature_base64 == package.signature_base64
+                && existing.payload == package.payload
+            {
+                return Ok(());
+            }
+            let existing_created_at = DateTime::parse_from_rfc3339(&existing.payload.created_at)
+                .map_err(|_| "stored baseline createdAt must be RFC3339".to_owned())?;
+            let replacement_created_at = DateTime::parse_from_rfc3339(&package.payload.created_at)
+                .map_err(|_| "replacement baseline createdAt must be RFC3339".to_owned())?;
+            if replacement_created_at <= existing_created_at {
+                return Err(
+                    "replacement baseline createdAt must be strictly newer; rollback or equal-timestamp replacement rejected"
+                        .to_owned(),
+                );
+            }
+        }
+        if let Some(existing_source) = transaction
+            .query_row(
+                "SELECT source FROM relay_baselines WHERE id=?1",
+                params![&package.payload.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        {
+            if existing_source != "community" {
+                return Err(
+                    "the signed baseline id collides with another evidence namespace".to_owned(),
+                );
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO trusted_relay_baseline_packages(
+                   id, signing_key_id, model, protocol, expires_at, json
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                   signing_key_id=excluded.signing_key_id,
+                   model=excluded.model,
+                   protocol=excluded.protocol,
+                   expires_at=excluded.expires_at,
+                   json=excluded.json",
+                params![
+                    &package.payload.id,
+                    &package.signing_key_id,
+                    &package.payload.model,
+                    protocol,
+                    &package.payload.expires_at,
+                    package_json,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO relay_baselines(id, source, version, imported_at, expires_at, json)
+                 VALUES(?1, 'community', ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                   source='community',
+                   version=excluded.version,
+                   imported_at=excluded.imported_at,
+                   expires_at=excluded.expires_at,
+                   json=excluded.json",
+                params![
+                    &summary.id,
+                    &summary.version,
+                    &package.verified_at,
+                    &summary.expires_at,
+                    summary_json,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        secure_database_sidecars(&self.root)?;
+        Ok(())
+    }
+
+    pub fn get_trusted_relay_baseline_package(
+        &self,
+        baseline_id: &str,
+    ) -> Result<Option<TrustedRelayBaselinePackage>, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        let row = connection
+            .query_row(
+                "SELECT packages.json, anchors.json
+                 FROM trusted_relay_baseline_packages AS packages
+                 JOIN relay_baseline_trust_anchors AS anchors
+                   ON anchors.key_id=packages.signing_key_id
+                 WHERE packages.id=?1",
+                params![baseline_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        row.map(|(package_json, anchor_json)| {
+            let package: TrustedRelayBaselinePackage =
+                serde_json::from_str(&package_json).map_err(|error| error.to_string())?;
+            let anchor: RelayBaselineTrustAnchor =
+                serde_json::from_str(&anchor_json).map_err(|error| error.to_string())?;
+            package.reverify(&anchor)?;
+            Ok(package)
+        })
+        .transpose()
+    }
+
+    pub fn list_trusted_relay_baseline_packages(
+        &self,
+    ) -> Result<Vec<TrustedRelayBaselinePackage>, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT packages.json, anchors.json
+                 FROM trusted_relay_baseline_packages AS packages
+                 JOIN relay_baseline_trust_anchors AS anchors
+                   ON anchors.key_id=packages.signing_key_id
+                 ORDER BY packages.id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (package_json, anchor_json) = row.map_err(|error| error.to_string())?;
+            let package: TrustedRelayBaselinePackage =
+                serde_json::from_str(&package_json).map_err(|error| error.to_string())?;
+            let anchor: RelayBaselineTrustAnchor =
+                serde_json::from_str(&anchor_json).map_err(|error| error.to_string())?;
+            package.reverify(&anchor)?;
+            Ok(package)
+        })
+        .collect()
+    }
+
+    pub fn delete_imported_relay_baseline(&self, baseline_id: &str) -> Result<bool, String> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let trusted = transaction
+            .query_row(
+                "SELECT 1 FROM trusted_relay_baseline_packages WHERE id=?1",
+                params![baseline_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some();
+        let changed = transaction
+            .execute(
+                "DELETE FROM relay_baselines
+                 WHERE id=?1 AND (source='user' OR (?2=1 AND source='community'))",
+                params![baseline_id, if trusted { 1_i64 } else { 0_i64 }],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM trusted_relay_baseline_packages WHERE id=?1",
+                params![baseline_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        secure_database_sidecars(&self.root)?;
+        Ok(changed > 0)
     }
 
     pub fn delete_user_relay_baseline(&self, baseline_id: &str) -> Result<bool, String> {
@@ -1373,19 +1750,31 @@ mod tests {
     use crate::{
         connection::ConnectionOriginSnapshot,
         model::{
-            ConversationSnapshot, QualityAssessment, RequestSnapshot, ServerRouteSnapshot,
-            StatusLevel, StatusSnapshot, ThreadKind, TimingSnapshot, UsageSnapshot,
+            CollectorHealth, ConversationSnapshot, MonitorSnapshot, QualityAssessment,
+            RequestSnapshot, ServerRouteSnapshot, StatusLevel, StatusSnapshot, ThreadKind,
+            TimingSnapshot, UsageSnapshot, SNAPSHOT_SCHEMA_VERSION,
         },
         relay_audit::{
             AuditDetector, AuditMode, AuditParametersSnapshot, ConnectionEvidence,
             EvidenceConfidence, IdentityAssessment, IdentityAssessmentKind, OverallVerdict,
-            PrivateProbePackReference, ProtocolAssessment, QualityAssessmentKind, RelayProtocol,
-            RelayQualityAssessment, UsageAssessment, UsageAssessmentKind,
-            RELAY_AUDIT_REPORT_SCHEMA_VERSION,
+            PrivateProbePackReference, ProbeFamily, ProbeLanguage, ProtocolAssessment,
+            QualityAssessmentKind, RelayProtocol, RelayQualityAssessment, UsageAssessment,
+            UsageAssessmentKind, RELAY_AUDIT_REPORT_SCHEMA_VERSION,
         },
-        relay_baseline::RelayBaselineSummary,
+        relay_baseline::{
+            canonical_signed_payload_bytes, verify_signed_relay_baseline,
+            RelayBaselineFingerprintCell, RelayBaselineFingerprintParameters,
+            RelayBaselinePayloadV1, RelayBaselineSummary, RelayBaselineTrustAnchor,
+            SignedRelayBaselinePackageV1, FINGERPRINT_GENERATOR_VERSION,
+            FINGERPRINT_NORMALIZATION_VERSION, SIGNED_RELAY_BASELINE_ALGORITHM,
+            SIGNED_RELAY_BASELINE_SCHEMA_VERSION,
+        },
     };
-    use serde_json::json;
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+    use chrono::Utc;
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
 
     fn assert_state_files_exclude(root: &Path, forbidden: &[&str]) {
         for entry in fs::read_dir(root).expect("read state directory") {
@@ -1406,6 +1795,46 @@ mod tests {
         }
     }
 
+    fn monitor_snapshot_fixture(title: Option<&str>) -> MonitorSnapshot {
+        let conversations = title
+            .map(|title| {
+                vec![ConversationSnapshot {
+                    thread_id: "thread-persistence-private".to_owned(),
+                    turn_id: "turn-persistence-private".to_owned(),
+                    parent_thread_id: None,
+                    kind: ThreadKind::Root,
+                    title: title.to_owned(),
+                    source_timestamp: Some("2026-08-27T01:00:00Z".to_owned()),
+                    active_request: RequestSnapshot::new(
+                        Some("gpt-5.6-sol".to_owned()),
+                        Some("ultra".to_owned()),
+                        "turnContext",
+                    ),
+                    pending_next_turn: None,
+                    server_route: ServerRouteSnapshot::default(),
+                    usage: UsageSnapshot::default(),
+                    timing: TimingSnapshot::default(),
+                    quality_assessment: QualityAssessment::default(),
+                    connection_origin: ConnectionOriginSnapshot::unknown(),
+                    tool_activity: false,
+                    status: StatusSnapshot {
+                        level: StatusLevel::Green,
+                        code: "ok".to_owned(),
+                        explanation: "request configuration consistent".to_owned(),
+                    },
+                    anomalies: Vec::new(),
+                }]
+            })
+            .unwrap_or_default();
+        MonitorSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            checked_at: "2026-08-27T01:02:03.000Z".to_owned(),
+            codex_running: true,
+            collector_health: CollectorHealth::default(),
+            conversations,
+        }
+    }
+
     fn relay_report_fixture(audit_id: &str, profile_id: &str) -> RelayAuditReportV1 {
         RelayAuditReportV1 {
             schema_version: RELAY_AUDIT_REPORT_SCHEMA_VERSION,
@@ -1417,6 +1846,7 @@ mod tests {
             completed_at: Some("2026-08-27T02:01:00Z".to_owned()),
             parameters: AuditParametersSnapshot {
                 mode: AuditMode::Quick,
+                effort: None,
                 max_requests: 150,
                 max_input_tokens: 50_000,
                 max_output_tokens: 10_000,
@@ -1460,7 +1890,9 @@ mod tests {
                 reasons: Vec::new(),
                 limitations: vec!["physicalModelNotProven".to_owned()],
             },
+            anti_evasion_findings: Default::default(),
             paired_baseline: None,
+            trusted_static_baseline: None,
             community_baseline: None,
             selective_service_assessment: None,
             overall_verdict: OverallVerdict::InsufficientEvidence,
@@ -1475,17 +1907,205 @@ mod tests {
         let root = std::env::temp_dir().join(format!("xiaoli-persistence-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let persistence = Persistence::open(&root).unwrap();
-        persistence
-            .save_snapshot(&json!({"schemaVersion": 4}), "2026-08-25T00:00:00Z")
+        let snapshot = monitor_snapshot_fixture(None);
+        let stored = persistence
+            .save_snapshot(&snapshot, &snapshot.checked_at)
             .unwrap();
-        assert_eq!(
-            persistence.load_snapshot_json().unwrap().unwrap(),
-            "{\"schemaVersion\":4}"
-        );
+        assert_eq!(persistence.load_snapshot_json().unwrap().unwrap(), stored);
         assert_eq!(
             fs::read_to_string(persistence.latest_snapshot_path()).unwrap(),
-            "{\"schemaVersion\":4}"
+            stored
         );
+        assert_eq!(
+            serde_json::from_str::<Value>(&stored).unwrap()["schemaVersion"],
+            SNAPSHOT_SCHEMA_VERSION
+        );
+        drop(persistence);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_persistence_redacts_prompt_title_from_sqlite_and_json_file() {
+        const PRIVATE_TITLE: &str = "PRIVATE_PROMPT_DERIVED_TITLE_MUST_STAY_IN_MEMORY";
+        const PRIVATE_CWD: &str = "C:\\PRIVATE_CWD_MUST_NOT_PERSIST\\repo";
+        const PRIVATE_BODY: &str = "PRIVATE_MESSAGE_BODY_MUST_NOT_PERSIST";
+        let root = std::env::temp_dir().join(format!(
+            "xiaoli-snapshot-redaction-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let persistence = Persistence::open(&root).unwrap();
+        let snapshot = monitor_snapshot_fixture(Some(&format!(
+            "{PRIVATE_TITLE} {PRIVATE_CWD} {PRIVATE_BODY}"
+        )));
+
+        persistence
+            .save_snapshot(&snapshot, &snapshot.checked_at)
+            .unwrap();
+
+        let persisted = persistence.load_snapshot_json().unwrap().unwrap();
+        let value = serde_json::from_str::<Value>(&persisted).unwrap();
+        assert_eq!(
+            value["conversations"][0]["title"],
+            "2026-08-27T01:02 · thread-p"
+        );
+        assert_eq!(
+            snapshot.conversations[0].title,
+            format!("{PRIVATE_TITLE} {PRIVATE_CWD} {PRIVATE_BODY}"),
+            "redaction must not mutate the in-memory UI snapshot"
+        );
+        assert_state_files_exclude(&root, &[PRIVATE_TITLE, PRIVATE_CWD, PRIVATE_BODY]);
+
+        drop(persistence);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trusted_baseline_is_reverified_and_revocation_removes_it_from_scoring_storage() {
+        let root = std::env::temp_dir().join(format!(
+            "xiaoli-trusted-baseline-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_millis()
+        ));
+        let persistence = Persistence::open(&root).unwrap();
+        let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+        let anchor = RelayBaselineTrustAnchor {
+            key_id: "explicit-local-key".to_owned(),
+            label: "Explicit local key".to_owned(),
+            public_key_base64: BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes()),
+            created_at: "2026-08-27T00:00:00Z".to_owned(),
+        };
+        persistence
+            .upsert_relay_baseline_trust_anchor(&anchor)
+            .unwrap();
+        let payload = RelayBaselinePayloadV1 {
+            id: "community-signed-fixture".to_owned(),
+            label: "Community signed fixture".to_owned(),
+            source: "community".to_owned(),
+            version: "1".to_owned(),
+            model: "gpt-5.6-sol".to_owned(),
+            effort: None,
+            protocol: RelayProtocol::OpenAiResponses,
+            sample_count: 40,
+            created_at: "2026-08-27T00:00:00Z".to_owned(),
+            expires_at: Some("2026-11-27T00:00:00Z".to_owned()),
+            parameters: RelayBaselineFingerprintParameters {
+                generator_version: FINGERPRINT_GENERATOR_VERSION.to_owned(),
+                normalization_version: FINGERPRINT_NORMALIZATION_VERSION.to_owned(),
+                temperature_milli: 1_000,
+                max_output_tokens: 16,
+                same_model_max_mean_jsd_micros: 120_000,
+                different_model_min_mean_jsd_micros: 300_000,
+            },
+            fingerprint_cells: [
+                (ProbeFamily::Number, "7"),
+                (ProbeFamily::Letter, "a"),
+                (ProbeFamily::Color, "blue"),
+                (ProbeFamily::Animal, "cat"),
+            ]
+            .into_iter()
+            .map(|(family, output)| RelayBaselineFingerprintCell {
+                family,
+                language: ProbeLanguage::English,
+                counts: BTreeMap::from([(output.to_owned(), 10)]),
+            })
+            .collect(),
+            limitations: Vec::new(),
+        };
+        let signature = signing_key.sign(&canonical_signed_payload_bytes(&payload).unwrap());
+        let signed = SignedRelayBaselinePackageV1 {
+            schema_version: SIGNED_RELAY_BASELINE_SCHEMA_VERSION,
+            algorithm: SIGNED_RELAY_BASELINE_ALGORITHM.to_owned(),
+            key_id: anchor.key_id.clone(),
+            payload,
+            signature_base64: BASE64_STANDARD.encode(signature.to_bytes()),
+        };
+        let trusted =
+            verify_signed_relay_baseline(&signed, &anchor, "2026-08-27T01:00:00Z".to_owned())
+                .unwrap();
+        persistence
+            .upsert_trusted_relay_baseline_package(&trusted)
+            .unwrap();
+        let mut identical_reimport = trusted.clone();
+        identical_reimport.verified_at = "2026-08-27T02:00:00Z".to_owned();
+        persistence
+            .upsert_trusted_relay_baseline_package(&identical_reimport)
+            .expect("identical signed content must be idempotent");
+        assert_eq!(
+            persistence
+                .get_trusted_relay_baseline_package(&trusted.payload.id)
+                .unwrap()
+                .unwrap()
+                .verified_at,
+            "2026-08-27T01:00:00Z"
+        );
+
+        let mut equal_timestamp_payload = trusted.payload.clone();
+        equal_timestamp_payload.version = "different-at-same-time".to_owned();
+        let equal_signature =
+            signing_key.sign(&canonical_signed_payload_bytes(&equal_timestamp_payload).unwrap());
+        let equal_timestamp = verify_signed_relay_baseline(
+            &SignedRelayBaselinePackageV1 {
+                schema_version: SIGNED_RELAY_BASELINE_SCHEMA_VERSION,
+                algorithm: SIGNED_RELAY_BASELINE_ALGORITHM.to_owned(),
+                key_id: anchor.key_id.clone(),
+                payload: equal_timestamp_payload,
+                signature_base64: BASE64_STANDARD.encode(equal_signature.to_bytes()),
+            },
+            &anchor,
+            "2026-08-27T02:00:00Z".to_owned(),
+        )
+        .unwrap();
+        assert!(persistence
+            .upsert_trusted_relay_baseline_package(&equal_timestamp)
+            .unwrap_err()
+            .contains("strictly newer"));
+
+        let mut newer_payload = trusted.payload.clone();
+        newer_payload.version = "2".to_owned();
+        newer_payload.created_at = "2026-08-27T01:00:00Z".to_owned();
+        newer_payload.expires_at = Some("2026-11-27T01:00:00Z".to_owned());
+        let newer_signature =
+            signing_key.sign(&canonical_signed_payload_bytes(&newer_payload).unwrap());
+        let newer = verify_signed_relay_baseline(
+            &SignedRelayBaselinePackageV1 {
+                schema_version: SIGNED_RELAY_BASELINE_SCHEMA_VERSION,
+                algorithm: SIGNED_RELAY_BASELINE_ALGORITHM.to_owned(),
+                key_id: anchor.key_id.clone(),
+                payload: newer_payload,
+                signature_base64: BASE64_STANDARD.encode(newer_signature.to_bytes()),
+            },
+            &anchor,
+            "2026-08-27T01:30:00Z".to_owned(),
+        )
+        .unwrap();
+        persistence
+            .upsert_trusted_relay_baseline_package(&newer)
+            .expect("strictly newer signed content may replace the package");
+        assert!(persistence
+            .upsert_trusted_relay_baseline_package(&trusted)
+            .unwrap_err()
+            .contains("strictly newer"));
+        assert!(persistence
+            .get_trusted_relay_baseline_package(&newer.payload.id)
+            .unwrap()
+            .is_some());
+        let summaries = persistence.list_relay_baselines().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].signature_verified);
+        assert!(summaries[0].usable_for_scoring);
+
+        assert_eq!(
+            persistence
+                .delete_relay_baseline_trust_anchor(&anchor.key_id)
+                .unwrap(),
+            1
+        );
+        assert!(persistence
+            .get_trusted_relay_baseline_package(&trusted.payload.id)
+            .unwrap()
+            .is_none());
+        assert!(persistence.list_relay_baselines().unwrap().is_empty());
         drop(persistence);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1975,6 +2595,27 @@ mod tests {
 
         let mut report = relay_report_fixture("audit-safe", &profile.id);
         report.parameters.private_probe_pack = Some(pack_reference.clone());
+        report.anti_evasion_findings = crate::relay_audit::AntiEvasionAssessment {
+            state: crate::relay_audit::AntiEvasionAssessmentKind::SuspiciousBehavior,
+            persistent_signals: vec![
+                crate::relay_audit::AntiEvasionSignal::CacheDistributionCollapse,
+                crate::relay_audit::AntiEvasionSignal::ParaphraseDrift,
+            ],
+            factors: vec![crate::relay_audit::AntiEvasionFactor {
+                batch_id: "anti-evasion-batch-0".to_owned(),
+                signal: crate::relay_audit::AntiEvasionSignal::CacheDistributionCollapse,
+                paired_samples: 40,
+                target_primary: 0.9,
+                reference_primary: 0.2,
+                target_secondary: None,
+                reference_secondary: None,
+                primary_threshold: 0.3,
+                secondary_threshold: None,
+                suspicious: true,
+            }],
+            reasons: vec!["twoSignalsAcrossTwoBatches".to_owned()],
+            limitations: vec!["doesNotProvePhysicalModel".to_owned()],
+        };
         persistence.save_relay_audit(&report).unwrap();
         assert_eq!(
             persistence.get_relay_audit("audit-safe").unwrap(),
@@ -1989,6 +2630,7 @@ mod tests {
             id: "official-gpt-5.6-sol".to_owned(),
             label: "Official paired baseline".to_owned(),
             model: "gpt-5.6-sol".to_owned(),
+            effort: None,
             protocol: RelayProtocol::OpenAiResponses,
             source: "official".to_owned(),
             version: "2026-08-27".to_owned(),
@@ -1996,6 +2638,10 @@ mod tests {
             created_at: "2026-08-27T01:00:00Z".to_owned(),
             expires_at: Some("2026-09-27T01:00:00Z".to_owned()),
             signed: false,
+            signature_verified: false,
+            signing_key_id: None,
+            usable_for_scoring: false,
+            scoring_mode: None,
             limitations: vec!["pairedToExactParameters".to_owned()],
         };
         let user = RelayBaselineSummary {
@@ -2136,10 +2782,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let persistence = Persistence::open(&root).unwrap();
         persistence
-            .save_snapshot(
-                &serde_json::json!({"schemaVersion":4}),
-                "2030-01-01T00:00:00Z",
-            )
+            .save_snapshot(&monitor_snapshot_fixture(None), "2030-01-01T00:00:00Z")
             .unwrap();
         persistence
             .append_monitor_log(&serde_json::json!({"event":"fixture"}))

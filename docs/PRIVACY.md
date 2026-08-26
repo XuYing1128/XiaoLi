@@ -45,7 +45,7 @@
 
 API Key 不在上表任何文件中。默认只放在进程内存；用户明确勾选后，只保存到 Windows Credential Manager、macOS Keychain 或 Linux Secret Service，SQLite 只保存不含 Key 的凭据引用。Linux Secret Service 不可用时回退内存并提示，不回退到明文文件。
 
-中转审计导入的 `RelayBaselineSummary` 在 `v0.2.0-beta.1` 只是本地参考元数据，不包含可供 scorer 使用的响应样本或分布。Release 还内置了从公开、可引用来源整理的小型版本化分布：它们随源码编译进发布物，不保存原始 prompt/回复，只作跨协议、低置信度的实验性相对排名。可用于中/高置信度配对统计的参考，只来自用户明确授权后，在同一次审计中实时调用的匹配官方 profile。
+普通 `RelayBaselineSummary` 和未验证导入项只是本地参考元数据。用户可以另行显式导入 Ed25519 公钥作为本地信任锚；只有由该 key 签名、完整分布与参数通过验证且未过期的包，才会保存到独立的可信静态基线表并用于低置信指纹 scorer。公钥、签名和规范化一词计数可以持久化，但包不包含原始 prompt/回复；中转响应不能写入可信表。撤销信任锚会同步移除由它验证的 scorer 包。Release 还内置从公开来源整理的小型版本化分布，只作跨协议、低置信实验排名。可用于中/高置信度配对统计的参考，仍只来自用户明确授权后在同一次审计中实时调用的匹配官方 profile。
 
 默认目录：
 
@@ -60,7 +60,7 @@ API Key 不在上表任何文件中。默认只放在进程内存；用户明确
 - Windows 命名管道名称包含当前用户 SID，ACL 仅允许当前用户。
 - Unix socket 放在当前用户目录，父目录权限为 `0700`，socket 为 `0600`。
 - endpoint 文件不包含凭据，只用于本机组件发现。
-- hook 连接失败会 fail-open，不阻塞 Codex。
+- hook 处理不访问网络；标准输入、解析、本地 IPC 与原子 fallback 共享 150ms 单调时钟硬上限，失败或超时会 fail-open，不阻塞 Codex。
 
 ## Probe 和日志脱敏
 

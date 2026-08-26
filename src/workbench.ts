@@ -14,8 +14,11 @@ type AuthMode = "chatGpt" | "apiKey" | "external" | "unknown";
 type OriginConfidence = "configured" | "partial" | "unknown";
 type RelayProtocol = "openAiResponses" | "openAiChatCompletions" | "anthropicMessages";
 type AuditMode = "quick" | "standard" | "deep";
+type AuditEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 type AuditVerdict = "consistent" | "insufficientEvidence" | "suspectedPadding" | "suspectedDegradation" | "significantlyDifferent" | "confirmedContractMismatch" | "failed" | "cancelled";
 type SelectiveServiceState = "notApplicable" | "insufficientEvidence" | "noMismatchObserved" | "suspectedSelectiveService";
+type AntiEvasionState = "notRun" | "insufficientEvidence" | "consistent" | "suspiciousBehavior";
+type AntiEvasionSignal = "cacheDistributionCollapse" | "suspiciouslyLowStableLatency" | "paraphraseDrift" | "roleFormatSensitivity";
 
 interface ConnectionOriginSnapshot {
   kind: OriginKind;
@@ -113,12 +116,34 @@ interface SelectiveServiceAssessment {
   limitations: string[];
 }
 
+interface AntiEvasionFactor {
+  batchId: string;
+  signal: AntiEvasionSignal;
+  pairedSamples: number;
+  targetPrimary: number;
+  referencePrimary: number;
+  targetSecondary?: number;
+  referenceSecondary?: number;
+  primaryThreshold: number;
+  secondaryThreshold?: number;
+  suspicious: boolean;
+}
+
+interface AntiEvasionAssessment {
+  state: AntiEvasionState;
+  persistentSignals: AntiEvasionSignal[];
+  factors: AntiEvasionFactor[];
+  reasons: string[];
+  limitations: string[];
+}
+
 interface RelayAuditReport {
   auditId: string;
   profileId?: string;
   profileLabel: string;
   claimedModel: string;
   protocol: RelayProtocol;
+  requestedEffort?: AuditEffort;
   startedAt?: string;
   completedAt?: string;
   overallVerdict: AuditVerdict;
@@ -127,6 +152,7 @@ interface RelayAuditReport {
   usageReconciliation: AxisFinding;
   qualityFindings: AxisFinding;
   fingerprintFindings: AxisFinding;
+  antiEvasionFindings: AntiEvasionAssessment;
   reasons: string[];
   limitations: string[];
   quantitativeEvidence: Array<{ label: string; value: string }>;
@@ -137,6 +163,7 @@ interface RelayBaseline {
   id: string;
   label: string;
   model: string;
+  effort?: string;
   protocol?: RelayProtocol;
   source: "official" | "community" | "user";
   version?: string;
@@ -144,10 +171,20 @@ interface RelayBaseline {
   createdAt?: string;
   expiresAt?: string;
   signed: boolean;
+  signatureVerified: boolean;
+  signingKeyId?: string;
+  usableForScoring: boolean;
   builtIn: boolean;
   referenceProtocol?: string;
   scoringMode?: string;
   limitations: string[];
+}
+
+interface RelayBaselineTrustAnchor {
+  keyId: string;
+  label: string;
+  publicKeyBase64: string;
+  createdAt: string;
 }
 
 interface AuditSchedule {
@@ -198,6 +235,7 @@ interface WorkbenchState {
   profiles: RelayProfile[];
   audits: RelayAuditReport[];
   baselines: RelayBaseline[];
+  baselineTrustAnchors: RelayBaselineTrustAnchor[];
   schedule: AuditSchedule;
   selectedProfileId?: string;
   activeAudit?: RelayAuditProgress;
@@ -308,6 +346,7 @@ const state: WorkbenchState = {
   profiles: [],
   audits: [],
   baselines: [],
+  baselineTrustAnchors: [],
   schedule: { enabled: false, cadence: "weekly", weekday: 1, localTime: "20:00", pairOfficial: false, monthlyRequestLimit: 1_000, monthlyReservedRequests: 0, historyRetentionDays: 180 },
   credentials: new Map(),
   unlisteners: [],
@@ -320,6 +359,7 @@ let historyLoadSerial = 0;
 let profilesLoadSerial = 0;
 let auditsLoadSerial = 0;
 let baselinesLoadSerial = 0;
+let baselineTrustLoadSerial = 0;
 let scheduleLoadSerial = 0;
 let auditEventRevision = 0;
 let overviewEventRevision = 0;
@@ -441,7 +481,7 @@ function overviewPage(): string {
             ${axisCard("protocol", "协议兼容", "检查认证、基础响应、SSE 与错误契约")}
             ${axisCard("usage", "计量一致", "检查 usage 算术；可选实时官方配对")}
             ${axisCard("quality", "行为质量", "结构化 JSON、nonce 检索、约束推理与多语言")}
-            ${axisCard("identity", "模型身份", "无实时官方配对时固定为证据不足")}
+            ${axisCard("identity", "模型身份", "实时官方配对提供较高置信参考；可信签名静态包仅提供低置信参考")}
           </div>
         </article>
         <article class="card card-pad">
@@ -543,7 +583,9 @@ function relayPage(): string {
               <label class="mode-option"><input type="radio" name="audit-mode" value="standard" /><span>标准<small>16 cells × 15</small></span></label>
               <label class="mode-option"><input type="radio" name="audit-mode" value="deep" /><span>深度<small>40 cells × 15</small></span></label>
             </div></fieldset>
-             <label class="field"><span>可选实时官方配对端点</span><select id="audit-baseline"><option value="">不配对（自洽检查；质量/身份灰色）</option></select><small class="field-help">只列出同协议、同精确模型的第一方 profile；导入参考摘要不参与评分。</small></label>
+             <label class="field"><span>请求 effort（可选）</span><select id="audit-effort"><option value="">不设置（使用 provider 默认）</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option><option value="ultra">ultra</option></select><small class="field-help audit-effort-help">实时官方配对会在两端使用完全相同的 effort；未设置时不能把 provider 默认值视为受控参数。</small></label>
+             <label class="field"><span>可选实时官方配对端点</span><select id="audit-baseline"><option value="">不使用实时官方配对</option></select><small class="field-help">只列出同协议、同精确模型的第一方 profile；提供中/高置信同次运行参考并使请求量近似翻倍。</small></label>
+             <label class="field"><span>可选签名静态指纹参考</span><select id="audit-static-baseline"><option value="">不使用静态参考</option></select><small class="field-help">只列出已验签、未过期且与当前协议/精确模型/effort 匹配的包；仅低置信身份轴，不增加请求。</small></label>
             <div class="budget-panel" aria-label="审计预算上限">
               <div class="budget-item"><span>最大请求</span><strong class="budget-requests">150</strong></div>
               <div class="budget-item"><span>输入 token 上限</span><strong class="budget-input">1.2m</strong></div>
@@ -580,12 +622,19 @@ function baselinesPage(): string {
       </article>
       <aside class="stack">
         <article class="card card-pad">
-          <div class="section-heading"><div><h2>导入参考摘要</h2><p>当前测试版只校验 JSON 结构和大小；用户导入默认标记为“未验证签名”。</p></div></div>
-          <div class="form-grid"><label class="field"><span>摘要文件</span><input id="baseline-file" type="file" accept="application/json,.json" /></label><div class="privacy-callout"><strong>不参与评分：</strong>导入项只是本地元数据，不含 scorer 可用样本，也不会让模型身份轴变绿。</div><div class="form-actions"><button class="secondary-button" type="button" data-action="baseline-import">校验格式并导入元数据</button></div></div>
+          <div class="section-heading"><div><h2>导入签名参考</h2><p>先由你显式信任发布公钥，再导入由该 keyId 签名的分布包。包内自带公钥永远不会被采用。</p></div></div>
+          <div class="form-grid">
+            <label class="field"><span>信任锚 JSON</span><input id="baseline-trust-file" type="file" accept="application/json,.json" /><small class="field-help">包含 keyId、label、publicKeyBase64；导入公钥是独立的显式信任动作。</small></label>
+            <div class="form-actions"><button class="secondary-button" type="button" data-action="baseline-trust-import">导入本地信任锚</button></div>
+            <div class="baseline-trust-list"></div>
+            <label class="field"><span>参考包 JSON</span><input id="baseline-file" type="file" accept="application/json,.json" /></label>
+            <div class="privacy-callout"><strong>严格分层：</strong>只有签名覆盖完整参数与规范化分布、并通过本地信任锚验证的未过期包，才可作为无实时官方配对时的低置信 scorer。未验证文件仍只保存元数据。</div>
+            <div class="form-actions"><button class="secondary-button" type="button" data-action="baseline-import">验证签名并导入</button></div>
+          </div>
         </article>
         <article class="card card-pad">
           <div class="section-heading"><div><h2>参考证据边界</h2></div></div>
-          <ul class="reason-list"><li>只有同次运行的实时官方配对能进入中/高置信统计比较。</li><li>内置社区参考协议不匹配，只显示低置信实验排名，不改变总裁决。</li><li>导入摘要和中转响应都不能污染内置或实时官方参考。</li></ul>
+          <ul class="reason-list"><li>只有同次运行的实时官方配对能进入中/高置信统计比较。</li><li>已验证且参数匹配的静态签名包仅作低置信指纹参考，不能单独把总裁决判为“正常”，也不能证明物理模型。</li><li>未知 keyId、无效签名、过期包和普通摘要只显示元数据，不进入 scorer。</li><li>中转响应与未验证导入项不能污染可信社区表或实时官方参考。</li></ul>
         </article>
       </aside>
     </div>
@@ -604,16 +653,16 @@ function principlesPage(): string {
       </div>
     </article>
     <div class="status-guide-grid">
-      ${statusGuide("green", "绿色 · 该轴未见异常", "协议/usage 自洽可独立为绿；模型身份只有实时官方配对后才可显示与参考一致，仍非物理模型证明。")}
+      ${statusGuide("green", "绿色 · 该轴未见异常", "协议/usage 自洽可独立为绿；模型身份可显示与实时官方参考一致，或与已验签静态参考一致（低置信），两者都不是物理模型证明；静态一致不能单独令总裁决为正常。")}
       ${statusGuide("yellow", "黄色 · 疑似异常", "可能是过量计数、实时配对下的行为降质、指纹偏离，或主动审计正常但同一中转的真实会话长期异常。这些都是保守警告，不是物理模型证明。")}
       ${statusGuide("red", "红色 · 明确契约异常", "可复现的 usage 不可能算术、协议包络/SSE 或自报型号契约矛盾。")}
-      ${statusGuide("gray", "灰色 · 证据不足", "没有实时匹配参考、样本不足、参数不可控或当前协议无法检查；灰色不是通过。")}
+      ${statusGuide("gray", "灰色 · 证据不足", "没有实时匹配参考或可用的可信签名静态参考、样本不足、参数不可控或当前协议无法检查；灰色不是通过。")}
     </div>
     <div class="method-grid">
       <article class="card method-card"><h3>如何寻找 token 注水</h3><ul><li>先验证 usage 各项算术是否自洽。</li><li>对已知 OpenAI tokenizer 计算可见 token，未知别名不宣称绝对精确。</li><li>多个输入量级对比官方配对或可解释区间。</li></ul></article>
       <article class="card method-card"><h3>如何寻找降质</h3><ul><li>使用结构化 JSON、长上下文 nonce、算术/约束推理、多语言、工具选择与状态保持六个域。</li><li>工具域通过三种协议发送真实工具 schema，只在本地评分结构化工具名/参数，绝不执行调用。</li><li>状态保持只验证同一请求内的多消息历史，不代表跨网络会话或物理模型证明；实时官方配对下至少两个域持续偏离才发出黄色提示。</li></ul></article>
       <article class="card method-card"><h3>如何寻找选择性服务</h3><ul><li>仅当一次主动审计与匹配参考一致时，才对比同一本地中转 profile 绑定的最近 30 天真实 Codex 完成回合。</li><li>至少 10 个回合，且至少 5 个、占比不低于一半仍有保守的降质警告，才显示“疑似选择性服务”。</li><li>该评估始终独立于四条证据轴，不改写审计结论，也不识别物理模型。</li></ul></article>
-      <article class="card method-card"><h3>如何提高规避成本</h3><ul><li>每次本地随机化参数、改写、语言和顺序。</li><li>交错发送官方与中转请求，比较原题与改写题的差异。</li><li>检查响应缓存导致的分布和延迟方差塌缩。</li></ul></article>
+      <article class="card method-card"><h3>如何提高规避成本</h3><ul><li>标准/深度档按本次 CSPRNG 种子随机化题序、语义改写、角色消息和空白格式；快速档不会运行这组统计。</li><li>分别检查回答分布坍缩、异常低且低方差延迟、原题/改写偏移、角色/格式敏感四类信号；延迟信号要求中位数不高于参考的 35%，且 MAD 不高于 max(参考 MAD × 25%, 2ms 下限)。</li><li>只有至少两类独立信号在两个批次都越过保守门槛，才给出独立黄色“抗规避行为异常”；它不改写四条证据轴、总裁决或模型身份。</li></ul></article>
       <article class="card method-card"><h3>仍然无法排除什么</h3><ul><li>中转可能通过 TLS、流量形态或题型识别审计。</li><li>能识别所有审计流量的服务可选择性转发真实模型。</li><li>因此所有报告都保留“无法密码学证明”限制。</li></ul></article>
     </div>
   </section>`;
@@ -745,6 +794,27 @@ function normalizeAxis(value: unknown, fallbackSummary = "尚未运行主动检�
     summary: cleanText(pick(raw, "summary", "explanation", "label"), 260) ?? inferred.summary,
     details: details.slice(0, 20),
   };
+}
+
+function normalizeFingerprintAxis(report: Record<string, unknown>): AxisFinding {
+  const finding = normalizeAxis(pick(report, "fingerprintFindings", "fingerprint_findings"));
+  const paired = asRecord(pick(report, "pairedBaseline", "paired_baseline"));
+  const trustedStatic = asRecord(pick(report, "trustedStaticBaseline", "trusted_static_baseline"));
+  const hasPairedReference = Boolean(cleanText(pick(paired, "profileId", "profile_id"), 120));
+  const hasTrustedStaticReference = Boolean(cleanText(
+    pick(trustedStatic, "baselineId", "baseline_id"),
+    128,
+  ));
+  if (!hasPairedReference && hasTrustedStaticReference) {
+    const state = finding.state.replace(/[-_\s]/g, "").toLowerCase();
+    if (state === "referenceconsistent") {
+      finding.summary = "与已验签静态参考一致 · 低置信";
+    } else if (state === "referencedifferent") {
+      finding.summary = "与已验签静态参考显著不同 · 低置信";
+    }
+    finding.details.unshift("参考类型：本机信任的签名静态包，不是本次实时官方配对");
+  }
+  return finding;
 }
 
 function normalizeProtocol(value: unknown): RelayProtocol {
@@ -900,9 +970,73 @@ function normalizeSelectiveServiceAssessment(value: unknown): SelectiveServiceAs
   };
 }
 
+function normalizeAntiEvasionAssessment(value: unknown): AntiEvasionAssessment {
+  const raw = asRecord(value);
+  const normalizedState = cleanText(raw.state)?.replace(/[-_\s]/g, "").toLowerCase();
+  const states: Record<string, AntiEvasionState> = {
+    notrun: "notRun",
+    insufficientevidence: "insufficientEvidence",
+    consistent: "consistent",
+    suspiciousbehavior: "suspiciousBehavior",
+  };
+  const state = (normalizedState && states[normalizedState]) || "notRun";
+  const signals: Record<string, AntiEvasionSignal> = {
+    cachedistributioncollapse: "cacheDistributionCollapse",
+    suspiciouslylowstablelatency: "suspiciouslyLowStableLatency",
+    paraphrasedrift: "paraphraseDrift",
+    roleformatsensitivity: "roleFormatSensitivity",
+  };
+  const persistentSignals = stringList(pick(raw, "persistentSignals", "persistent_signals"), 8)
+    .map((signal) => signals[signal.replace(/[-_\s]/g, "").toLowerCase()])
+    .filter((signal): signal is AntiEvasionSignal => Boolean(signal));
+  const factors = (Array.isArray(raw.factors) ? raw.factors : [])
+    .slice(0, 16)
+    .map((value): AntiEvasionFactor | undefined => {
+      const factor = asRecord(value);
+      const signalKey = cleanText(factor.signal)?.replace(/[-_\s]/g, "").toLowerCase();
+      const signal = signalKey ? signals[signalKey] : undefined;
+      const targetPrimary = numberValue(pick(factor, "targetPrimary", "target_primary"));
+      const referencePrimary = numberValue(pick(factor, "referencePrimary", "reference_primary"));
+      const primaryThreshold = numberValue(pick(factor, "primaryThreshold", "primary_threshold"));
+      if (!signal || targetPrimary === undefined || referencePrimary === undefined || primaryThreshold === undefined) return undefined;
+      return {
+        batchId: cleanText(pick(factor, "batchId", "batch_id"), 80) ?? "unknown-batch",
+        signal,
+        pairedSamples: Math.max(0, Math.trunc(numberValue(pick(factor, "pairedSamples", "paired_samples")) ?? 0)),
+        targetPrimary,
+        referencePrimary,
+        targetSecondary: numberValue(pick(factor, "targetSecondary", "target_secondary")),
+        referenceSecondary: numberValue(pick(factor, "referenceSecondary", "reference_secondary")),
+        primaryThreshold,
+        secondaryThreshold: numberValue(pick(factor, "secondaryThreshold", "secondary_threshold")),
+        suspicious: booleanValue(factor.suspicious),
+      };
+    })
+    .filter((factor): factor is AntiEvasionFactor => Boolean(factor));
+  const reasons = state === "suspiciousBehavior"
+    ? [`${persistentSignals.length} 类独立行为信号在两个批次都超过保守门槛。`]
+    : state === "consistent"
+      ? ["未见至少两类独立信号连续跨两个批次异常。"]
+      : state === "insufficientEvidence"
+        ? ["匹配官方样本或每批次可比较 cell 不足，无法完成抗规避判断。"]
+        : ["快速档不运行抗规避统计；请选择标准或深度档并配置同协议官方配对。"];
+  return {
+    state,
+    persistentSignals,
+    factors,
+    reasons,
+    limitations: [
+      "该结果是独立的黄色行为警告，不改写四条证据轴或总裁决。",
+      "缓存策略、网络距离、服务负载和采样随机性都可能影响这些统计量。",
+      "即使未见异常，也不能证明服务器物理模型身份或排除选择性服务。",
+    ],
+  };
+}
+
 function normalizeReport(value: unknown, index: number): RelayAuditReport {
   const raw = asRecord(value);
   const profile = asRecord(raw.profile);
+  const parameters = asRecord(raw.parameters);
   const verdict = normalizeVerdict(pick(raw, "overallVerdict", "overall_verdict", "verdict"));
   return {
     auditId: cleanText(pick(raw, "auditId", "audit_id", "id"), 140) ?? `audit-${index + 1}`,
@@ -910,6 +1044,7 @@ function normalizeReport(value: unknown, index: number): RelayAuditReport {
     profileLabel: cleanText(firstDefined(pick(raw, "profileLabel", "profile_label"), profile.label), 100) ?? "未命名端点",
     claimedModel: cleanText(pick(raw, "claimedModel", "claimed_model", "model"), 120) ?? "未知模型",
     protocol: normalizeProtocol(firstDefined(raw.protocol, profile.protocol)),
+    requestedEffort: normalizeAuditEffort(firstDefined(parameters.effort, pick(raw, "requestedEffort", "requested_effort"))),
     startedAt: cleanText(pick(raw, "startedAt", "started_at"), 80),
     completedAt: cleanText(pick(raw, "completedAt", "completed_at"), 80),
     overallVerdict: verdict,
@@ -917,7 +1052,8 @@ function normalizeReport(value: unknown, index: number): RelayAuditReport {
     protocolFindings: normalizeAxis(pick(raw, "protocolFindings", "protocol_findings")),
     usageReconciliation: normalizeAxis(pick(raw, "usageReconciliation", "usage_reconciliation")),
     qualityFindings: normalizeAxis(pick(raw, "qualityFindings", "quality_findings")),
-    fingerprintFindings: normalizeAxis(pick(raw, "fingerprintFindings", "fingerprint_findings")),
+    fingerprintFindings: normalizeFingerprintAxis(raw),
+    antiEvasionFindings: normalizeAntiEvasionAssessment(pick(raw, "antiEvasionFindings", "anti_evasion_findings")),
     reasons: stringList(raw.reasons, 20),
     limitations: stringList(raw.limitations, 20),
     quantitativeEvidence: normalizeReportMetrics(raw),
@@ -928,6 +1064,9 @@ function normalizeReport(value: unknown, index: number): RelayAuditReport {
 function normalizeReportMetrics(raw: Record<string, unknown>): Array<{ label: string; value: string }> {
   const metrics: Array<{ label: string; value: string }> = [];
   const parameters = asRecord(raw.parameters);
+  const protocol = normalizeProtocol(raw.protocol);
+  const effort = normalizeAuditEffort(firstDefined(parameters.effort, pick(raw, "requestedEffort", "requested_effort")));
+  metrics.push({ label: "请求 effort", value: auditEffortText(protocol, effort) });
   const privateProbePack = normalizePrivateProbePack(pick(parameters, "privateProbePack", "private_probe_pack"));
   if (privateProbePack) {
     metrics.push({
@@ -1034,7 +1173,21 @@ function normalizeReportMetrics(raw: Record<string, unknown>): Array<{ label: st
   const completedCases = numberValue(pick(paired, "completedCases", "completed_cases"));
   if (completedCases !== undefined) {
     const model = cleanText(paired.model, 120) ?? "模型未知";
-    metrics.push({ label: "实时官方配对", value: `${model} · ${Math.trunc(completedCases)} 个完成 case` });
+    const effort = normalizeAuditEffort(paired.effort);
+    metrics.push({ label: "实时官方配对", value: `${model} · ${auditEffortText(protocol, effort)} · ${Math.trunc(completedCases)} 个完成 case` });
+  }
+
+  const trustedStatic = asRecord(pick(raw, "trustedStaticBaseline", "trusted_static_baseline"));
+  const trustedStaticId = cleanText(pick(trustedStatic, "baselineId", "baseline_id"), 128);
+  if (trustedStaticId) {
+    const model = cleanText(trustedStatic.model, 120) ?? "模型未知";
+    const effort = normalizeAuditEffort(trustedStatic.effort);
+    const version = cleanText(trustedStatic.version, 60) ?? "版本未知";
+    const keyId = cleanText(pick(trustedStatic, "signingKeyId", "signing_key_id"), 128) ?? "签名 key 未知";
+    metrics.push({
+      label: "签名静态参考",
+      value: `${model} · ${auditEffortText(protocol, effort)} · ${version} · key ${keyId} · 低置信身份轴 · 不可单独产生正常总裁决`,
+    });
   }
 
   const community = asRecord(pick(raw, "communityBaseline", "community_baseline"));
@@ -1102,6 +1255,7 @@ function normalizeBaseline(value: unknown, index: number): RelayBaseline {
     id: cleanText(raw.id, 120) ?? `baseline-${index + 1}`,
     label: cleanText(raw.label, 100) ?? `基线 ${index + 1}`,
     model: cleanText(raw.model, 120) ?? "未知模型",
+    effort: cleanText(raw.effort, 40),
     protocol: raw.protocol === undefined ? undefined : normalizeProtocol(raw.protocol),
     source,
     version: cleanText(raw.version, 60),
@@ -1109,10 +1263,23 @@ function normalizeBaseline(value: unknown, index: number): RelayBaseline {
     createdAt: cleanText(pick(raw, "createdAt", "created_at"), 80),
     expiresAt: cleanText(pick(raw, "expiresAt", "expires_at"), 80),
     signed: booleanValue(raw.signed, false),
+    signatureVerified: booleanValue(pick(raw, "signatureVerified", "signature_verified"), false),
+    signingKeyId: cleanText(pick(raw, "signingKeyId", "signing_key_id"), 128),
+    usableForScoring: booleanValue(pick(raw, "usableForScoring", "usable_for_scoring"), false),
     builtIn: booleanValue(pick(raw, "builtIn", "built_in"), false),
     referenceProtocol: cleanText(pick(raw, "referenceProtocol", "reference_protocol"), 160),
     scoringMode: cleanText(pick(raw, "scoringMode", "scoring_mode"), 80),
     limitations: stringList(raw.limitations, 12),
+  };
+}
+
+function normalizeBaselineTrustAnchor(value: unknown, index: number): RelayBaselineTrustAnchor {
+  const raw = asRecord(value);
+  return {
+    keyId: cleanText(pick(raw, "keyId", "key_id"), 128) ?? `unknown-key-${index + 1}`,
+    label: cleanText(raw.label, 100) ?? `本地信任锚 ${index + 1}`,
+    publicKeyBase64: cleanText(pick(raw, "publicKeyBase64", "public_key_base64"), 128) ?? "",
+    createdAt: cleanText(pick(raw, "createdAt", "created_at"), 80) ?? "",
   };
 }
 
@@ -1194,12 +1361,17 @@ function verdictLevel(verdict: AuditVerdict): StatusLevel {
 
 function reportEffectiveLevel(report: RelayAuditReport): StatusLevel {
   const selectiveLevel = report.selectiveServiceAssessment?.state === "suspectedSelectiveService" ? "yellow" : "gray";
-  return maxLevel(verdictLevel(report.overallVerdict), selectiveLevel);
+  const antiEvasionLevel = report.antiEvasionFindings.state === "suspiciousBehavior" ? "yellow" : "gray";
+  return maxLevel(verdictLevel(report.overallVerdict), selectiveLevel, antiEvasionLevel);
 }
 
 function reportHeadline(report: RelayAuditReport): string {
-  return report.selectiveServiceAssessment?.state === "suspectedSelectiveService"
-    ? `疑似选择性服务（四轴：${VERDICT_TEXT[report.overallVerdict]}）`
+  const warnings = [
+    report.selectiveServiceAssessment?.state === "suspectedSelectiveService" ? "疑似选择性服务" : "",
+    report.antiEvasionFindings.state === "suspiciousBehavior" ? "抗规避行为异常" : "",
+  ].filter(Boolean);
+  return warnings.length
+    ? `${warnings.join(" · ")}（四轴：${VERDICT_TEXT[report.overallVerdict]}）`
     : VERDICT_TEXT[report.overallVerdict];
 }
 
@@ -1338,6 +1510,7 @@ function invalidatePendingLoads(): void {
   profilesLoadSerial += 1;
   auditsLoadSerial += 1;
   baselinesLoadSerial += 1;
+  baselineTrustLoadSerial += 1;
   scheduleLoadSerial += 1;
 }
 
@@ -1381,6 +1554,7 @@ function render(): void {
   renderProfiles();
   renderAudits();
   renderBaselines();
+  renderAuditEffortState();
   renderBudget();
   renderProgress();
   if (focusKey && (document.activeElement as HTMLElement | null)?.dataset.focusKey !== focusKey) {
@@ -1703,7 +1877,7 @@ function reportRow(report: RelayAuditReport): HTMLElement {
   title.textContent = `${report.profileLabel}·${report.claimedModel}`;
   const meta = document.createElement("span");
   meta.className = "row-meta";
-  meta.textContent = `${reportHeadline(report)}·置信度 ${auditConfidenceText(report.confidence)}·${relativeTime(report.completedAt)}`;
+  meta.textContent = `${auditEffortText(report.protocol, report.requestedEffort)}·${reportHeadline(report)}·置信度 ${auditConfidenceText(report.confidence)}·${relativeTime(report.completedAt)}`;
   copy.append(title, meta);
   const button = document.createElement("button");
   button.type = "button";
@@ -1724,6 +1898,25 @@ function renderBaselines(): void {
   if (list) list.replaceChildren(...state.baselines.map(baselineRow));
   setVisible(list, state.baselines.length > 0);
   setVisible(mount.querySelector(".baseline-empty"), state.baselines.length === 0);
+  const trustList = mount.querySelector<HTMLElement>(".baseline-trust-list");
+  if (trustList) trustList.replaceChildren(...state.baselineTrustAnchors.map(baselineTrustAnchorRow));
+  renderBaselineSelect();
+}
+
+function baselineTrustAnchorRow(anchor: RelayBaselineTrustAnchor): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "baseline-row";
+  const copy = document.createElement("div");
+  const title = document.createElement("span");
+  title.className = "row-title";
+  title.textContent = anchor.label;
+  const meta = document.createElement("span");
+  meta.className = "row-meta";
+  meta.textContent = `${anchor.keyId}·${anchor.createdAt ? new Date(anchor.createdAt).toLocaleString("zh-CN") : "本地导入"}`;
+  copy.append(title, meta);
+  row.append(copy, rowAction("baseline-trust-delete", anchor.keyId, "撤销信任并移除由此密钥验证的基线", "trash", true));
+  row.title = "撤销信任会让该密钥签名的静态基线立即退出 scorer；这不会删除审计报告。";
+  return row;
 }
 
 function baselineRow(baseline: RelayBaseline): HTMLElement {
@@ -1748,22 +1941,30 @@ function baselineRow(baseline: RelayBaseline): HTMLElement {
       : baseline.source === "community"
         ? baseline.signed ? "签名社区摘要" : "未签名社区摘要"
         : "用户导入摘要";
-  source.textContent = baseline.builtIn ? `${sourceLabel}·低置信实验排名` : `${sourceLabel}·仅元数据`;
+  source.textContent = baseline.builtIn
+    ? `${sourceLabel}·低置信实验排名`
+    : baseline.signatureVerified && baseline.usableForScoring
+      ? `${sourceLabel}·已验证·低置信 scorer`
+      : `${sourceLabel}·仅元数据`;
   row.title = baseline.builtIn
     ? "该公开分布随 Release 编译，但请求协议与小狸审计不匹配；它只用于低置信相对排名，不改变证据轴或总裁决。"
-    : "导入摘要不交给 scorer；中/高置信模型身份统计只使用本次实时官方配对。";
+    : baseline.signatureVerified && baseline.usableForScoring
+      ? "签名、适用参数和分布已由本机信任锚验证。它只在没有实时官方配对时提供低置信指纹参考，不能证明物理模型或单独产生正常总裁决。"
+      : "此项未通过本地信任链与适用性验证，不交给 scorer。";
   row.append(copy, source);
-  if (baseline.source === "user" && !baseline.builtIn) row.append(rowAction("baseline-delete", baseline.id, "删除用户参考摘要", "trash", true));
+  if (!baseline.builtIn) row.append(rowAction("baseline-delete", baseline.id, "删除导入参考", "trash", true));
   return row;
 }
 
 function renderBaselineSelect(): void {
   const select = mount.querySelector<HTMLSelectElement>("#audit-baseline");
-  if (!select) return;
+  const staticSelect = mount.querySelector<HTMLSelectElement>("#audit-static-baseline");
+  if (!select || !staticSelect) return;
   const current = select.value;
+  const staticCurrent = staticSelect.value;
   const placeholder = document.createElement("option");
   placeholder.value = "";
-  placeholder.textContent = "不配对（自洽检查；质量/身份灰色）";
+  placeholder.textContent = "不使用实时官方配对";
   const selected = state.profiles.find((profile) => profile.id === state.selectedProfileId);
   const options = state.profiles.filter((profile) =>
     profile.id !== state.selectedProfileId
@@ -1777,6 +1978,30 @@ function renderBaselineSelect(): void {
   });
   select.replaceChildren(placeholder, ...options);
   if (options.some((option) => option.value === current)) select.value = current;
+
+  const staticPlaceholder = document.createElement("option");
+  staticPlaceholder.value = "";
+  staticPlaceholder.textContent = "不使用静态参考";
+  const requestedEffort = selectedAuditEffort();
+  const staticOptions = state.baselines
+    .filter((baseline) =>
+      !baseline.builtIn
+      && baseline.signatureVerified
+      && baseline.usableForScoring
+      && Boolean(baseline.protocol)
+      && baseline.effort === requestedEffort
+      && (!selected || (baseline.protocol === selected.protocol && baseline.model === selected.defaultModel)),
+    )
+    .map((baseline) => {
+      const option = document.createElement("option");
+      option.value = baseline.id;
+      option.textContent = `${baseline.label}·${baseline.model}·${requestedEffort ?? "未设置 effort"}·低置信静态`;
+      return option;
+    });
+  staticSelect.replaceChildren(staticPlaceholder, ...staticOptions);
+  if (staticOptions.some((option) => option.value === staticCurrent)) staticSelect.value = staticCurrent;
+  select.disabled = Boolean(staticSelect.value);
+  staticSelect.disabled = Boolean(select.value);
 }
 
 function isOfficialProfile(profile: RelayProfile): boolean {
@@ -1947,6 +2172,43 @@ function selectedAuditMode(): AuditMode {
   return selected === "standard" || selected === "deep" ? selected : "quick";
 }
 
+function normalizeAuditEffort(value: unknown): AuditEffort | undefined {
+  const normalized = cleanText(value, 16)?.toLowerCase();
+  return normalized === "low" || normalized === "medium" || normalized === "high"
+    || normalized === "xhigh" || normalized === "max" || normalized === "ultra"
+    ? normalized
+    : undefined;
+}
+
+function selectedAuditEffort(): AuditEffort | undefined {
+  return normalizeAuditEffort(mount.querySelector<HTMLSelectElement>("#audit-effort")?.value);
+}
+
+function auditEffortText(protocol: RelayProtocol, effort: AuditEffort | undefined): string {
+  if (protocol === "anthropicMessages") return "不适用（Anthropic Messages）";
+  return effort ? `${effort}（请求）` : "未设置（使用 provider 默认）";
+}
+
+function renderAuditEffortState(showWarning = false): void {
+  const select = mount.querySelector<HTMLSelectElement>("#audit-effort");
+  const help = mount.querySelector<HTMLElement>(".audit-effort-help");
+  if (!select) return;
+  const anthropic = mount.querySelector<HTMLSelectElement>("#relay-protocol")?.value === "anthropicMessages";
+  const cleared = anthropic && Boolean(select.value);
+  if (cleared) select.value = "";
+  select.disabled = anthropic;
+  select.setAttribute("aria-disabled", String(anthropic));
+  if (help) {
+    help.textContent = anthropic
+      ? "Anthropic Messages 不支持 OpenAI reasoning effort；本次审计固定为不适用。"
+      : "实时官方配对会在两端使用完全相同的 effort；未设置时不能把 provider 默认值视为受控参数。";
+  }
+  if (cleared) {
+    renderBaselineSelect();
+    if (showWarning) showNotice("Anthropic Messages 不支持 OpenAI reasoning effort，已清除该请求参数", "yellow", 7_000);
+  }
+}
+
 function activeAuditSnapshot(): RelayAuditProgress | undefined {
   // Backend events can update this property while an awaited command is in flight.
   return state.activeAudit;
@@ -2036,6 +2298,16 @@ async function loadBaselines(quiet = true): Promise<boolean> {
   return true;
 }
 
+async function loadBaselineTrustAnchors(quiet = true): Promise<boolean> {
+  const requestId = ++baselineTrustLoadSerial;
+  if (MOCK_MODE) return true;
+  const result = await command<unknown>("list_relay_baseline_trust_anchors", undefined, quiet);
+  if (requestId !== baselineTrustLoadSerial || result === undefined) return false;
+  state.baselineTrustAnchors = listFromEnvelope(result, "trustAnchors", "trust_anchors")
+    .map(normalizeBaselineTrustAnchor);
+  return true;
+}
+
 async function loadSchedule(quiet = true): Promise<boolean> {
   const requestId = ++scheduleLoadSerial;
   if (MOCK_MODE) return true;
@@ -2050,7 +2322,7 @@ async function refreshAll(quiet = false): Promise<void> {
   state.loading.add("refresh");
   setRefreshBusy(true);
   try {
-    const results = await withUiTimeout(Promise.all([loadOverview(quiet), loadHistory(false, quiet), loadProfiles(quiet), loadAudits(quiet), loadBaselines(quiet), loadSchedule(quiet)]));
+    const results = await withUiTimeout(Promise.all([loadOverview(quiet), loadHistory(false, quiet), loadProfiles(quiet), loadAudits(quiet), loadBaselines(quiet), loadBaselineTrustAnchors(quiet), loadSchedule(quiet)]));
     if (!quiet && results.some(Boolean)) showNotice("工作台已使用最新本地证据", "green", 2_600);
   } catch (error) {
     if (error instanceof UiRefreshTimeoutError) {
@@ -2076,7 +2348,7 @@ async function refreshCurrentPage(): Promise<void> {
         : state.page === "relay"
           ? Promise.all([loadProfiles(false), loadAudits(false), loadBaselines(true)])
           : state.page === "baselines"
-            ? loadBaselines(false)
+            ? Promise.all([loadBaselines(false), loadBaselineTrustAnchors(false)])
             : loadOverview(true);
     await withUiTimeout(Promise.resolve(refresh));
   } catch (error) {
@@ -2131,6 +2403,7 @@ function clearProfileForm(): void {
   state.selectedProfileId = undefined;
   setText(".connection-test-state", "");
   renderPrivateProbeState();
+  renderAuditEffortState();
   renderProfiles();
   renderBaselineSelect();
   mount.querySelector<HTMLInputElement>("#relay-label")?.focus();
@@ -2150,6 +2423,7 @@ function populateProfileForm(profile: RelayProfile): void {
   if (keychain) keychain.checked = Boolean(profile.credentialRef);
   setText(".connection-test-state", profile.credentialRef ? "已关联系统凭据" : state.credentials.has(profile.id) ? "当前进程已有凭据" : "");
   renderPrivateProbeState(profile.privateProbePack);
+  renderAuditEffortState();
   renderProfiles();
   renderBaselineSelect();
 }
@@ -2283,7 +2557,7 @@ async function testConnection(): Promise<void> {
   if (button) button.disabled = true;
   setText(".connection-test-state", "正在检查，最多 6 次请求…");
   try {
-    const raw = MOCK_MODE ? { ok: true, level: "green", summary: "认证、基础响应与 SSE 正常", usedRequests: 4 } : await command<unknown>("test_relay_connection", { profileId: state.selectedProfileId, profile, credential });
+    const raw = MOCK_MODE ? { ok: true, level: "green", summary: "认证、目标模型目录、基础响应与 SSE 正常", usedRequests: 3 } : await command<unknown>("test_relay_connection", { profileId: state.selectedProfileId, profile, credential });
     if (raw === undefined) return;
     const result = asRecord(raw);
     const ok = booleanValue(result.ok, cleanText(result.status)?.toLowerCase() === "ok");
@@ -2360,7 +2634,18 @@ async function startAudit(): Promise<void> {
     }
     const mode = selectedAuditMode();
     const budget = BUDGETS[mode];
+    const effort = selectedAuditEffort();
+    if (profile.protocol === "anthropicMessages" && effort) {
+      renderAuditEffortState(true);
+      showNotice("Anthropic Messages 不支持 OpenAI reasoning effort，请保持为不设置", "yellow", 7_000);
+      return;
+    }
     const officialBaselineProfileId = mount.querySelector<HTMLSelectElement>("#audit-baseline")?.value || undefined;
+    const trustedStaticBaselineId = mount.querySelector<HTMLSelectElement>("#audit-static-baseline")?.value || undefined;
+    if (officialBaselineProfileId && trustedStaticBaselineId) {
+      showNotice("实时官方配对与签名静态参考不能同时使用，请只选择一种", "yellow");
+      return;
+    }
     const credential = credentialForDraft(profile);
     if (!credential && !profile.credentialRef) {
       showNotice("开始审计前请输入 API Key，或为该端点绑定系统凭据", "yellow");
@@ -2382,11 +2667,25 @@ async function startAudit(): Promise<void> {
       showNotice("官方配对要求两端使用相同协议与精确模型，请先调整端点配置", "yellow", 8_000);
       return;
     }
+    const trustedStaticBaseline = trustedStaticBaselineId
+      ? state.baselines.find((item) => item.id === trustedStaticBaselineId)
+      : undefined;
+    if (trustedStaticBaselineId && (!trustedStaticBaseline
+      || !trustedStaticBaseline.signatureVerified
+      || !trustedStaticBaseline.usableForScoring
+      || trustedStaticBaseline.protocol !== profile.protocol
+      || trustedStaticBaseline.model !== profile.defaultModel
+      || trustedStaticBaseline.effort !== effort)) {
+      showNotice("选择的签名静态参考已失效、过期或与当前协议/模型/effort 不匹配，请刷新后重选", "yellow", 8_000);
+      return;
+    }
     const request = {
       profileId: profile.id,
       model: profile.defaultModel,
+      effort,
       mode,
       officialBaselineProfileId,
+      trustedStaticBaselineId,
       maxRequests: budget.requestLimit,
       maxInputTokens: budget.inputTokenLimit,
       maxOutputTokens: budget.outputTokenLimit,
@@ -2409,7 +2708,9 @@ async function startAudit(): Promise<void> {
       `开始${budget.label}审计？\n\n` +
       `目标：${profile.label}\n` +
       `模型：${profile.defaultModel}\n` +
+      `请求 effort：${auditEffortText(profile.protocol, effort)}\n` +
       `官方配对：${reference ? `${reference.label}（使用当前进程内存或系统凭据）` : "不调用"}\n` +
+      `签名静态参考：${trustedStaticBaseline ? `${trustedStaticBaseline.label}（低置信身份轴；不增加请求）` : "不使用"}\n` +
       `私有题包：${profile.privateProbePack ? `${profile.privateProbePack.version} · ${profile.privateProbePack.sha256.slice(0, 8)} · 每端点增加 ${preview.privateProbeRequests} 次、保守输入 ${formatTokens(preview.privateProbeInputTokens)}、输出 ${formatTokens(preview.privateProbeOutputTokens)}` : "未使用（增加 0 次）"}\n` +
       `完整计划：${preview.plannedRequests} 次 / 端点（内置 ${preview.builtInRequests} + 私有 ${preview.privateProbeRequests}），${preview.plannedRequests * multiplier} 次总操作\n` +
       `硬上限：${budget.requestLimit} 次 / 端点，${budget.requestLimit * multiplier} 次总请求\n` +
@@ -2686,13 +2987,19 @@ async function importBaseline(): Promise<void> {
   } else {
     const result = await command<unknown>("import_relay_baseline", { package: packageValue });
     if (result === undefined) return;
-    const verified = booleanValue(pick(asRecord(result), "signatureVerified", "signature_verified"));
+    const resultRecord = asRecord(result);
+    const verified = booleanValue(pick(resultRecord, "signatureVerified", "signature_verified"));
+    const usableForScoring = booleanValue(pick(resultRecord, "usableForScoring", "usable_for_scoring"));
     await loadBaselines(true);
     if (input) input.value = "";
     render();
     showNotice(
-      verified ? "参考摘要签名标记已验证并导入；当前 beta 仍不用于评分" : "参考摘要已导入，但未验证签名；当前 beta 不用于评分",
-      "yellow",
+      verified && usableForScoring
+        ? "签名参考已通过本地信任锚验证，参数匹配且未过期；可用于低置信指纹评分"
+        : verified
+          ? "参考包签名已验证，但当前已过期或不适用于 scorer；仅保留已验签元数据"
+          : "参考文件未通过本地信任链，只保存元数据，不参与评分",
+      verified && usableForScoring ? "green" : "yellow",
     );
     return;
   }
@@ -2701,9 +3008,63 @@ async function importBaseline(): Promise<void> {
   showNotice("参考摘要元数据已导入；浏览器预览不验证签名，也不用于评分", "yellow");
 }
 
+async function importBaselineTrustAnchor(): Promise<void> {
+  const input = mount.querySelector<HTMLInputElement>("#baseline-trust-file");
+  const file = input?.files?.[0];
+  if (!file) {
+    showNotice("请先选择信任锚 JSON", "yellow");
+    return;
+  }
+  if (file.size > 64 * 1024) {
+    showNotice("信任锚文件超过 64 KiB 上限", "yellow");
+    return;
+  }
+  let anchor: unknown;
+  try { anchor = JSON.parse(await file.text()); }
+  catch {
+    showNotice("无法解析信任锚 JSON", "yellow");
+    return;
+  }
+  const record = asRecord(anchor);
+  const keyId = cleanText(pick(record, "keyId", "key_id"), 128);
+  const label = cleanText(record.label, 100);
+  const publicKeyBase64 = cleanText(pick(record, "publicKeyBase64", "public_key_base64"), 128);
+  if (!keyId || !label || !publicKeyBase64) {
+    showNotice("信任锚必须包含 keyId、label 和 publicKeyBase64", "yellow");
+    return;
+  }
+  if (!window.confirm(`信任“${label}”（${keyId}）发布的小狸静态基线？\n\n这只信任其基线签名，不证明任何中转站或物理模型。`)) return;
+  if (MOCK_MODE) {
+    state.baselineTrustAnchors.push({ keyId, label, publicKeyBase64, createdAt: new Date().toISOString() });
+  } else {
+    const result = await command<unknown>("import_relay_baseline_trust_anchor", {
+      anchor: { keyId, label, publicKeyBase64 },
+    });
+    if (result === undefined) return;
+    await loadBaselineTrustAnchors(true);
+  }
+  if (input) input.value = "";
+  renderBaselines();
+  showNotice("本地信任锚已导入；现在可验证使用该 keyId 的参考包", "green", 7_000);
+}
+
+async function deleteBaselineTrustAnchor(keyId: string): Promise<void> {
+  const anchor = state.baselineTrustAnchors.find((item) => item.keyId === keyId);
+  if (!anchor || !window.confirm(`撤销对“${anchor.label}”的信任？\n\n由该密钥验证的静态基线会立即退出 scorer。`)) return;
+  if (!MOCK_MODE) {
+    const result = await command<unknown>("delete_relay_baseline_trust_anchor", { keyId });
+    if (result === undefined) return;
+    await Promise.all([loadBaselineTrustAnchors(true), loadBaselines(true)]);
+  } else {
+    state.baselineTrustAnchors = state.baselineTrustAnchors.filter((item) => item.keyId !== keyId);
+  }
+  renderBaselines();
+  showNotice("本地信任已撤销；相关静态基线不再参与评分", "gray", 7_000);
+}
+
 async function deleteBaseline(id: string): Promise<void> {
-  const baseline = state.baselines.find((item) => item.id === id && item.source === "user");
-  if (!baseline || !window.confirm(`删除用户参考摘要“${baseline.label}”？`)) return;
+  const baseline = state.baselines.find((item) => item.id === id && !item.builtIn);
+  if (!baseline || !window.confirm(`删除导入参考“${baseline.label}”？`)) return;
   if (!MOCK_MODE) {
     const result = await command<unknown>("delete_relay_baseline", { baselineId: id });
     if (result === undefined) return;
@@ -2810,7 +3171,7 @@ async function openReportDetail(auditId: string): Promise<void> {
   title.textContent = `${report.profileLabel}·${report.claimedModel}`;
   const meta = document.createElement("span");
   meta.className = "cell-secondary";
-  meta.textContent = `${PROTOCOL_TEXT[report.protocol]}·四轴 ${VERDICT_TEXT[report.overallVerdict]}·置信度 ${auditConfidenceText(report.confidence)}`;
+  meta.textContent = `${PROTOCOL_TEXT[report.protocol]}·请求 effort ${auditEffortText(report.protocol, report.requestedEffort)}·四轴 ${VERDICT_TEXT[report.overallVerdict]}·置信度 ${auditConfidenceText(report.confidence)}`;
   heading.append(title, meta);
   const axes = document.createElement("div");
   axes.className = "axis-grid";
@@ -2820,6 +3181,7 @@ async function openReportDetail(auditId: string): Promise<void> {
     reportAxis("行为质量", report.qualityFindings),
     reportAxis("模型身份", report.fingerprintFindings),
   );
+  const antiEvasion = reportAntiEvasionSection(report.antiEvasionFindings);
   const selectiveService = reportSelectiveServiceSection(report.selectiveServiceAssessment);
   const metrics = reportMetricSection(report.quantitativeEvidence);
   const reasons = titledList("判定原因", report.reasons, "本报告没有额外原因记录。");
@@ -2827,8 +3189,93 @@ async function openReportDetail(auditId: string): Promise<void> {
   const boundary = document.createElement("p");
   boundary.className = "privacy-callout";
   boundary.textContent = "即使四轴全部为绿色，也只表示本次范围内与参考一致；真实物理模型未获密码学证明。";
-  body.replaceChildren(heading, axes, selectiveService, metrics, reasons, limitations, boundary);
+  body.replaceChildren(heading, axes, antiEvasion, selectiveService, metrics, reasons, limitations, boundary);
   showDialog("report-dialog");
+}
+
+function antiEvasionSignalText(signal: AntiEvasionSignal): string {
+  const labels: Record<AntiEvasionSignal, string> = {
+    cacheDistributionCollapse: "回答分布坍缩",
+    suspiciouslyLowStableLatency: "异常低且低方差延迟",
+    paraphraseDrift: "原题/语义改写偏移",
+    roleFormatSensitivity: "角色/格式敏感",
+  };
+  return labels[signal];
+}
+
+function antiEvasionStateText(state: AntiEvasionState): string {
+  const labels: Record<AntiEvasionState, string> = {
+    notRun: "未运行（快速档不启用）",
+    insufficientEvidence: "证据不足",
+    consistent: "未见跨批次多信号异常",
+    suspiciousBehavior: "抗规避行为异常",
+  };
+  return labels[state];
+}
+
+function antiEvasionFactorText(factor: AntiEvasionFactor): string {
+  const batch = factor.batchId.endsWith("-1") ? "批次 2" : factor.batchId.endsWith("-0") ? "批次 1" : "未知批次";
+  const status = factor.suspicious ? "越过门槛" : "未越过门槛";
+  switch (factor.signal) {
+    case "cacheDistributionCollapse":
+      return `${batch} · ${status} · 中转碰撞概率 ${formatPercent(factor.targetPrimary)}，官方参考 ${formatPercent(factor.referencePrimary)}；中转需 ≥ ${formatPercent(factor.primaryThreshold)}，且差值需 ≥ ${formatPercent(factor.secondaryThreshold)}`;
+    case "suspiciouslyLowStableLatency":
+      return `${batch} · ${status} · 中转延迟中位数 ${formatDuration(factor.targetPrimary)} / MAD ${formatDuration(factor.targetSecondary)}，官方参考 ${formatDuration(factor.referencePrimary)} / MAD ${formatDuration(factor.referenceSecondary)}；中位数比例门槛 ${formatPercent(factor.primaryThreshold)}，MAD 门槛为 max(参考 MAD × ${formatPercent(factor.secondaryThreshold)}, 2ms 下限)`;
+    case "paraphraseDrift":
+    case "roleFormatSensitivity":
+      return `${batch} · ${status} · 中转 JSD ${factor.targetPrimary.toFixed(3)}，官方参考 ${factor.referencePrimary.toFixed(3)}；中转需 ≥ ${factor.primaryThreshold.toFixed(3)}，且差值需 ≥ ${(factor.secondaryThreshold ?? 0).toFixed(3)}`;
+  }
+}
+
+function reportAntiEvasionSection(assessment: AntiEvasionAssessment): HTMLElement {
+  const section = document.createElement("section");
+  section.className = "selective-service-section";
+  const heading = document.createElement("h3");
+  heading.textContent = "抗规避行为检查（独立证据）";
+  const card = document.createElement("article");
+  const level: StatusLevel = assessment.state === "suspiciousBehavior"
+    ? "yellow"
+    : assessment.state === "consistent" ? "green" : "gray";
+  card.className = "axis-card selective-service-card";
+  card.dataset.level = level;
+  const stateLabel = document.createElement("strong");
+  stateLabel.className = `status-${level}`;
+  stateLabel.textContent = antiEvasionStateText(assessment.state);
+  card.append(stateLabel);
+
+  if (assessment.persistentSignals.length) {
+    card.append(detailGrid([
+      ["跨批次持续信号", assessment.persistentSignals.map(antiEvasionSignalText).join("、")],
+      ["触发规则", "至少两类独立信号在两个批次都越过门槛"],
+    ]));
+  }
+
+  const details = [
+    ...assessment.factors.map((factor) => `${antiEvasionSignalText(factor.signal)} · ${factor.pairedSamples} 个配对样本：${antiEvasionFactorText(factor)}`),
+    ...assessment.reasons,
+    ...assessment.limitations.map((item) => `限制：${item}`),
+  ];
+  if (details.length) {
+    const disclosure = document.createElement("details");
+    disclosure.className = "axis-evidence-details";
+    const summary = document.createElement("summary");
+    summary.textContent = `查看 ${details.length} 条批次因子与限制`;
+    const list = document.createElement("ul");
+    list.className = "reason-list";
+    for (const detail of details) {
+      const item = document.createElement("li");
+      item.textContent = detail;
+      list.append(item);
+    }
+    disclosure.append(summary, list);
+    card.append(disclosure);
+  }
+
+  const boundary = document.createElement("p");
+  boundary.className = "cell-secondary";
+  boundary.textContent = "该结果只提高选择性服务与缓存规避的发现概率；无论是否通过，都不证明服务器物理模型身份。";
+  section.append(heading, card, boundary);
+  return section;
 }
 
 function reportSelectiveServiceSection(assessment: SelectiveServiceAssessment | undefined): HTMLElement {
@@ -3009,7 +3456,29 @@ function bindDomEvents(): void {
   mount.addEventListener("change", (event) => {
     const target = event.target;
     if (target instanceof HTMLInputElement && target.name === "audit-mode") renderBudget();
-    if (target instanceof HTMLSelectElement && target.id === "audit-baseline") renderBudget();
+    if (target instanceof HTMLSelectElement && target.id === "relay-protocol") {
+      renderAuditEffortState(true);
+      renderBaselineSelect();
+    }
+    if (target instanceof HTMLSelectElement && target.id === "audit-effort") {
+      renderBaselineSelect();
+    }
+    if (target instanceof HTMLSelectElement && target.id === "audit-baseline") {
+      if (target.value) {
+        const staticSelect = mount.querySelector<HTMLSelectElement>("#audit-static-baseline");
+        if (staticSelect) staticSelect.value = "";
+      }
+      renderBaselineSelect();
+      renderBudget();
+    }
+    if (target instanceof HTMLSelectElement && target.id === "audit-static-baseline") {
+      if (target.value) {
+        const liveSelect = mount.querySelector<HTMLSelectElement>("#audit-baseline");
+        if (liveSelect) liveSelect.value = "";
+      }
+      renderBaselineSelect();
+      renderBudget();
+    }
     if (target instanceof HTMLSelectElement && target.id === "schedule-cadence") {
       state.scheduleDraftDirty = true;
       const weekday = mount.querySelector<HTMLSelectElement>("#schedule-weekday");
@@ -3081,6 +3550,8 @@ async function handleAction(button: HTMLButtonElement): Promise<void> {
   else if (action === "audit-cancel") await cancelAudit();
   else if (action === "report-detail" && button.dataset.auditId) await openReportDetail(button.dataset.auditId);
   else if (action === "report-delete" && button.dataset.id) await deleteReport(button.dataset.id);
+  else if (action === "baseline-trust-import") await importBaselineTrustAnchor();
+  else if (action === "baseline-trust-delete" && button.dataset.id) await deleteBaselineTrustAnchor(button.dataset.id);
   else if (action === "baseline-import") await importBaseline();
   else if (action === "baseline-delete" && button.dataset.id) await deleteBaseline(button.dataset.id);
   else if (action === "dialog-close") button.closest<HTMLDialogElement>("dialog")?.close();
@@ -3246,6 +3717,18 @@ function mockReports(): RelayAuditReport[] {
     usageReconciliation: { level: "green", state: "consistent", summary: "usage 算术自洽，未见明确契约矛盾", details: [] },
     qualityFindings: { level: "green", state: "consistent", summary: "配对参考下的六个质量域未见持续异常", details: [] },
     fingerprintFindings: { level: "green", state: "referenceConsistent", summary: "本次参数下与配对参考行为一致", details: ["不等于物理模型身份证明"] },
+    antiEvasionFindings: {
+      state: "suspiciousBehavior",
+      persistentSignals: ["cacheDistributionCollapse", "paraphraseDrift"],
+      factors: [
+        { batchId: "anti-evasion-batch-0", signal: "cacheDistributionCollapse", pairedSamples: 40, targetPrimary: 0.86, referencePrimary: 0.34, primaryThreshold: 0.75, secondaryThreshold: 0.3, suspicious: true },
+        { batchId: "anti-evasion-batch-1", signal: "cacheDistributionCollapse", pairedSamples: 40, targetPrimary: 0.82, referencePrimary: 0.31, primaryThreshold: 0.75, secondaryThreshold: 0.3, suspicious: true },
+        { batchId: "anti-evasion-batch-0", signal: "paraphraseDrift", pairedSamples: 20, targetPrimary: 0.48, referencePrimary: 0.14, primaryThreshold: 0.3, secondaryThreshold: 0.2, suspicious: true },
+        { batchId: "anti-evasion-batch-1", signal: "paraphraseDrift", pairedSamples: 20, targetPrimary: 0.45, referencePrimary: 0.13, primaryThreshold: 0.3, secondaryThreshold: 0.2, suspicious: true },
+      ],
+      reasons: ["2 类独立行为信号在两个批次都超过保守门槛。"],
+      limitations: ["该结果是独立的黄色行为警告，不改写四条证据轴或总裁决。", "缓存策略、网络距离、服务负载和采样随机性都可能影响这些统计量。"],
+    },
     reasons: ["本次主动审计的四条证据轴在可比范围内一致。"],
     limitations: ["中转可能识别审计流量并选择性转发真实模型。", "模型更新、system prompt 和提供方差异都会改变行为分布。"],
     quantitativeEvidence: [
@@ -3266,8 +3749,8 @@ function mockReports(): RelayAuditReport[] {
 
 function mockBaselines(): RelayBaseline[] {
   return [
-    { id: "fpverify-demo-sol", label: "gpt-5.6-sol 公开参考", model: "gpt-5.6-sol", source: "community", version: "demo", sampleCount: 66, createdAt: "2026-07", signed: false, builtIn: true, referenceProtocol: "cursor-harness/harness-battery", scoringMode: "experimentalRelativeRanking", limitations: ["低置信跨协议排名"] },
-    { id: "baseline-user-summary", label: "示例参考摘要（不参与评分）", model: "gpt-5.6-sol", protocol: "openAiResponses", source: "user", version: "demo", sampleCount: 240, createdAt: new Date(Date.now() - 5 * 86_400_000).toISOString(), signed: false, builtIn: false, limitations: ["仅用于演示元数据列表；当前 beta scorer 不读取导入摘要"] },
+    { id: "fpverify-demo-sol", label: "gpt-5.6-sol 公开参考", model: "gpt-5.6-sol", source: "community", version: "demo", sampleCount: 66, createdAt: "2026-07", signed: false, signatureVerified: false, usableForScoring: false, builtIn: true, referenceProtocol: "cursor-harness/harness-battery", scoringMode: "experimentalRelativeRanking", limitations: ["低置信跨协议排名"] },
+    { id: "baseline-user-summary", label: "示例参考摘要（不参与评分）", model: "gpt-5.6-sol", protocol: "openAiResponses", source: "user", version: "demo", sampleCount: 240, createdAt: new Date(Date.now() - 5 * 86_400_000).toISOString(), signed: false, signatureVerified: false, usableForScoring: false, builtIn: false, limitations: ["仅用于演示元数据列表；未验证摘要不进入 scorer"] },
   ];
 }
 

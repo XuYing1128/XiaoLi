@@ -6,6 +6,8 @@ This file distinguishes software shipped as part of XiaoLi from projects consult
 
 XiaoLi uses [Tauri](https://github.com/tauri-apps/tauri) and official Tauri plugins. Tauri is available under the MIT License or Apache License 2.0. Individual Rust and JavaScript dependencies retain the licenses declared in their package metadata and lockfiles. Release archives include the generated `THIRD_PARTY_LICENSES.html` inventory.
 
+Signed relay-baseline packages are verified locally with [`ed25519-dalek`](https://github.com/dalek-cryptography/curve25519-dalek) (BSD-3-Clause) and decoded with the Rust [`base64`](https://github.com/marshallpierce/rust-base64) crate (MIT OR Apache-2.0). The generated license inventory and SPDX SBOM include the exact locked versions and transitive dependencies.
+
 ## Protocol reference
 
 [OpenAI Codex](https://github.com/openai/codex) is the authoritative reference for rollout, model-switching, and reroute-event semantics. XiaoLi does not vendor OpenAI Codex source code or artwork. OpenAI Codex is available under Apache License 2.0.

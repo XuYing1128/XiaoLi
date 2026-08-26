@@ -108,6 +108,10 @@ impl Default for ServerRouteSnapshot {
 pub struct UsageSnapshot {
     pub last: TokenUsage,
     pub cumulative: TokenUsage,
+    /// Internal turn-local delta used when writing per-turn history. It is
+    /// deliberately excluded from the public snapshot and all persisted JSON.
+    #[serde(skip)]
+    pub turn: TokenUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_cache_input_share: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,6 +301,26 @@ pub struct MonitorSnapshot {
     pub collector_health: CollectorHealth,
     #[serde(default)]
     pub conversations: Vec<ConversationSnapshot>,
+}
+
+impl MonitorSnapshot {
+    /// Returns the metadata-only snapshot allowed to cross the persistence
+    /// boundary. Prompt-derived session titles remain available to the live UI
+    /// but are replaced with a time and short-thread label on disk.
+    pub fn redacted_for_persistence(&self) -> Self {
+        let mut redacted = self.clone();
+        for conversation in &mut redacted.conversations {
+            conversation.title =
+                persistence_display_label(&self.checked_at, &conversation.thread_id);
+        }
+        redacted
+    }
+}
+
+pub fn persistence_display_label(checked_at: &str, thread_id: &str) -> String {
+    let time = checked_at.chars().take(16).collect::<String>();
+    let short_thread = thread_id.chars().take(8).collect::<String>();
+    format!("{time} · {short_thread}")
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]

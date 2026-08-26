@@ -47,6 +47,28 @@ pub fn safe_model_id(value: &str) -> String {
     }
 }
 
+/// Normalizes the finite reasoning-effort vocabulary accepted at XiaoLi's
+/// public audit boundary. Free-form provider values must never be forwarded or
+/// persisted as if they were a controlled parameter.
+pub fn normalize_audit_effort(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value else { return Ok(None) };
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    if matches!(
+        normalized.as_str(),
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+    ) {
+        Ok(Some(normalized))
+    } else {
+        Err(
+            "effort must be one of none, minimal, low, medium, high, xhigh, max, or ultra"
+                .to_owned(),
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RelayProtocol {
@@ -90,6 +112,8 @@ pub struct RelayProfile {
 pub struct RelayAuditRequest {
     pub profile_id: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     pub mode: AuditMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub official_baseline_profile_id: Option<String>,
@@ -123,6 +147,7 @@ impl RelayAuditRequest {
         if self.profile_id.trim().is_empty() || self.model.trim().is_empty() {
             return Err("profileId and model are required".to_owned());
         }
+        normalize_audit_effort(self.effort.as_deref())?;
         Ok(())
     }
 }
@@ -363,6 +388,63 @@ pub struct RelayQualityAssessment {
     pub limitations: Vec<String>,
 }
 
+/// Independent yellow-only evidence that an endpoint may be recognizing or
+/// shortcutting audit traffic. These observations never alter the four audit
+/// axes, the overall verdict, or the claimed/physical model identity.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AntiEvasionAssessmentKind {
+    #[default]
+    NotRun,
+    InsufficientEvidence,
+    Consistent,
+    SuspiciousBehavior,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AntiEvasionSignal {
+    CacheDistributionCollapse,
+    SuspiciouslyLowStableLatency,
+    ParaphraseDrift,
+    RoleFormatSensitivity,
+}
+
+/// Content-free aggregate for one signal in one independent batch. Generic
+/// primary/secondary values keep the public report stable while `signal`
+/// defines their units in the report explanation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntiEvasionFactor {
+    pub batch_id: String,
+    pub signal: AntiEvasionSignal,
+    pub paired_samples: usize,
+    pub target_primary: f64,
+    pub reference_primary: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_secondary: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_secondary: Option<f64>,
+    pub primary_threshold: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_threshold: Option<f64>,
+    pub suspicious: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntiEvasionAssessment {
+    pub state: AntiEvasionAssessmentKind,
+    #[serde(default)]
+    pub persistent_signals: Vec<AntiEvasionSignal>,
+    #[serde(default)]
+    pub factors: Vec<AntiEvasionFactor>,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default)]
+    pub limitations: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum QualityDomain {
@@ -436,6 +518,8 @@ pub struct ConnectionEvidence {
 #[serde(rename_all = "camelCase")]
 pub struct AuditParametersSnapshot {
     pub mode: AuditMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     pub max_requests: u32,
     pub max_input_tokens: u64,
     pub max_output_tokens: u64,
@@ -452,8 +536,28 @@ pub struct AuditParametersSnapshot {
 pub struct PairedBaselineSummary {
     pub profile_id: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     pub protocol: RelayProtocol,
     pub completed_cases: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedStaticBaselineSummary {
+    pub baseline_id: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    pub protocol: RelayProtocol,
+    pub version: String,
+    pub signing_key_id: String,
+    pub verified_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Always `low`; this is intentionally explicit so a signed package can
+    /// never be presented as a live matched official reference.
+    pub confidence: EvidenceConfidence,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -474,8 +578,14 @@ pub struct RelayAuditReportV1 {
     pub usage_reconciliation: UsageAssessment,
     pub quality_findings: RelayQualityAssessment,
     pub fingerprint_findings: IdentityAssessment,
+    /// Separate anti-evasion/behavior evidence. A suspicious state is yellow
+    /// only and deliberately does not change `overall_verdict`.
+    #[serde(default)]
+    pub anti_evasion_findings: AntiEvasionAssessment,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paired_baseline: Option<PairedBaselineSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_static_baseline: Option<TrustedStaticBaselineSummary>,
     /// Optional release-pinned public reference ranking. It is intentionally
     /// separate from the four evidence axes and never changes their states or
     /// the overall verdict.
@@ -670,9 +780,22 @@ pub struct ProbeCase {
     pub case_id: String,
     pub cell: ProbeCellKey,
     pub sample_index: usize,
+    pub batch_index: usize,
+    pub cohort: FingerprintProbeCohort,
+    pub prompt_variant: usize,
+    pub whitespace_variant: usize,
+    pub role_variant: usize,
     pub prompt: String,
     pub temperature: f64,
     pub max_output_tokens: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FingerprintProbeCohort {
+    Canonical,
+    Paraphrase,
+    RoleFormat,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -703,10 +826,26 @@ pub fn generate_probe_plan(seed: [u8; 32], mode: AuditMode) -> ProbePlan {
     cells.truncate(budget.fingerprint_cells);
 
     let mut cases = Vec::with_capacity(cells.len() * budget.samples_per_cell);
-    for cell in &cells {
+    for (cell_index, cell) in cells.iter().enumerate() {
         for sample_index in 0..budget.samples_per_cell {
-            let variant = rng.gen_range(4);
-            let whitespace = rng.gen_range(4);
+            // Five exact repeats expose fixed-answer caches. Five semantic
+            // rewrites and five role/format variants provide independent
+            // robustness cohorts without increasing the request budget.
+            let (cohort, variant, whitespace, role_variant) = match sample_index % 15 {
+                0..=4 => (FingerprintProbeCohort::Canonical, 0, 0, 0),
+                5..=9 => (
+                    FingerprintProbeCohort::Paraphrase,
+                    1 + rng.gen_range(3),
+                    rng.gen_range(4),
+                    0,
+                ),
+                _ => (
+                    FingerprintProbeCohort::RoleFormat,
+                    0,
+                    rng.gen_range(4),
+                    1 + rng.gen_range(2),
+                ),
+            };
             let prompt = render_probe_prompt(*cell, variant, whitespace);
             cases.push(ProbeCase {
                 case_id: format!(
@@ -717,6 +856,11 @@ pub fn generate_probe_plan(seed: [u8; 32], mode: AuditMode) -> ProbePlan {
                 ),
                 cell: *cell,
                 sample_index,
+                batch_index: cell_index % 2,
+                cohort,
+                prompt_variant: variant,
+                whitespace_variant: whitespace,
+                role_variant,
                 prompt,
                 temperature: 1.0,
                 max_output_tokens: 16,
@@ -1339,6 +1483,10 @@ pub struct ReportedUsage {
     pub input_tokens: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<i64>,
+    /// Anthropic cache-write tokens are a separate billed input component,
+    /// unlike OpenAI cached tokens which are a subset of input tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1371,9 +1519,23 @@ pub struct UsageArithmeticCheck {
 /// Checks only arithmetic invariants. A positive unexplained excess is not a
 /// confirmed padding verdict because hidden provider-side input can exist.
 pub fn check_usage_arithmetic(usage: &ReportedUsage) -> UsageArithmeticCheck {
+    check_usage_arithmetic_for_protocol(usage, RelayProtocol::OpenAiResponses)
+}
+
+/// Checks provider-specific token arithmetic. Anthropic reports uncached input,
+/// cache creation, and cache read as additive input components and does not
+/// expose an OpenAI-style total field.
+pub fn check_usage_arithmetic_for_protocol(
+    usage: &ReportedUsage,
+    protocol: RelayProtocol,
+) -> UsageArithmeticCheck {
     let fields = [
         ("inputTokens", usage.input_tokens),
         ("cachedInputTokens", usage.cached_input_tokens),
+        (
+            "cacheCreationInputTokens",
+            usage.cache_creation_input_tokens,
+        ),
         ("outputTokens", usage.output_tokens),
         ("reasoningOutputTokens", usage.reasoning_output_tokens),
         ("totalTokens", usage.total_tokens),
@@ -1390,10 +1552,12 @@ pub fn check_usage_arithmetic(usage: &ReportedUsage) -> UsageArithmeticCheck {
             reasons: vec![format!("negative token count in {}", negatives.join(", "))],
         };
     }
-    if matches!(
-        (usage.cached_input_tokens, usage.input_tokens),
-        (Some(cached), Some(input)) if cached > input
-    ) {
+    if protocol != RelayProtocol::AnthropicMessages
+        && matches!(
+            (usage.cached_input_tokens, usage.input_tokens),
+            (Some(cached), Some(input)) if cached > input
+        )
+    {
         return UsageArithmeticCheck {
             state: UsageArithmeticKind::ContractContradiction,
             expected_min_total: None,
@@ -1410,6 +1574,50 @@ pub fn check_usage_arithmetic(usage: &ReportedUsage) -> UsageArithmeticCheck {
             expected_min_total: None,
             unexplained_excess: None,
             reasons: vec!["reasoning output tokens exceed output tokens".to_owned()],
+        };
+    }
+    if protocol == RelayProtocol::AnthropicMessages {
+        if usage.input_tokens.is_none() || usage.output_tokens.is_none() {
+            return UsageArithmeticCheck {
+                state: UsageArithmeticKind::Missing,
+                expected_min_total: None,
+                unexplained_excess: None,
+                reasons: vec!["Anthropic input or output usage is missing".to_owned()],
+            };
+        }
+        let total_input = [
+            usage.input_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cached_input_tokens,
+        ]
+        .into_iter()
+        .flatten()
+        .try_fold(0_i64, i64::checked_add);
+        let Some(total_input) = total_input else {
+            return UsageArithmeticCheck {
+                state: UsageArithmeticKind::ContractContradiction,
+                expected_min_total: None,
+                unexplained_excess: None,
+                reasons: vec!["Anthropic input usage total overflow".to_owned()],
+            };
+        };
+        let Some(expected) = total_input.checked_add(usage.output_tokens.unwrap_or_default())
+        else {
+            return UsageArithmeticCheck {
+                state: UsageArithmeticKind::ContractContradiction,
+                expected_min_total: None,
+                unexplained_excess: None,
+                reasons: vec!["Anthropic token total overflow".to_owned()],
+            };
+        };
+        return UsageArithmeticCheck {
+            state: UsageArithmeticKind::Missing,
+            expected_min_total: Some(expected),
+            unexplained_excess: None,
+            reasons: vec![
+                "Anthropic reports additive input/cache components but no absolute total token field"
+                    .to_owned(),
+            ],
         };
     }
     let (Some(input), Some(output), Some(total)) =
@@ -1494,11 +1702,11 @@ pub fn assess_usage_padding(
             limitations: Vec::new(),
         };
     }
-    if !arithmetic.is_empty()
+    let all_arithmetic_missing = !arithmetic.is_empty()
         && arithmetic
             .iter()
-            .all(|check| check.state == UsageArithmeticKind::Missing)
-    {
+            .all(|check| check.state == UsageArithmeticKind::Missing);
+    if all_arithmetic_missing && scales.is_empty() {
         return UsageAssessment {
             state: UsageAssessmentKind::UsageMissing,
             factors: Vec::new(),
@@ -1560,10 +1768,10 @@ pub fn assess_usage_padding(
         .map(|factor| factor.input_size)
         .collect::<BTreeSet<_>>()
         .len();
-    let state = if distinct_suspicious_sizes >= 2 {
-        UsageAssessmentKind::SuspectedOvercount
-    } else {
-        UsageAssessmentKind::Consistent
+    let state = match distinct_suspicious_sizes {
+        0 => UsageAssessmentKind::Consistent,
+        1 => UsageAssessmentKind::InsufficientEvidence,
+        _ => UsageAssessmentKind::SuspectedOvercount,
     };
     let reasons = match distinct_suspicious_sizes {
         0 => vec!["no calibrated multi-scale overcount signal was observed".to_owned()],
@@ -1574,14 +1782,21 @@ pub fn assess_usage_padding(
             "calibrated excess persisted across {count} input sizes"
         )],
     };
+    let mut limitations = vec![
+        "suspected overcount is statistical evidence, not proof of intentional billing fraud"
+            .to_owned(),
+    ];
+    if all_arithmetic_missing {
+        limitations.push(
+            "the provider omitted an absolute total; the result uses matched visible-input deltas only"
+                .to_owned(),
+        );
+    }
     UsageAssessment {
         state,
         factors,
         reasons,
-        limitations: vec![
-            "suspected overcount is statistical evidence, not proof of intentional billing fraud"
-                .to_owned(),
-        ],
+        limitations,
     }
 }
 
@@ -2228,9 +2443,76 @@ mod tests {
             tolerance_tokens: 2.0,
         };
         let one = assess_usage_padding(&[], &[suspicious(256)], seed(6));
-        assert_eq!(one.state, UsageAssessmentKind::Consistent);
+        assert_eq!(one.state, UsageAssessmentKind::InsufficientEvidence);
+        assert_eq!(
+            derive_overall_verdict(
+                AuditLifecycle::Completed,
+                &normal_protocol(),
+                &one,
+                &consistent_quality(),
+                &consistent_identity(),
+            ),
+            OverallVerdict::InsufficientEvidence,
+            "one calibrated anomalous size must never produce an overall green verdict"
+        );
         let two = assess_usage_padding(&[], &[suspicious(256), suspicious(1024)], seed(6));
         assert_eq!(two.state, UsageAssessmentKind::SuspectedOvercount);
+    }
+
+    #[test]
+    fn paired_visible_input_deltas_work_when_provider_omits_absolute_total() {
+        // Anthropic reports input/output components but has no total_tokens
+        // field. Arithmetic remains explicitly missing; a matched official
+        // scale comparison is still valid evidence for relative overcount.
+        let anthropic_like = ReportedUsage {
+            input_tokens: Some(256),
+            output_tokens: Some(1),
+            total_tokens: None,
+            ..ReportedUsage::default()
+        };
+        let checks = vec![check_usage_arithmetic(&anthropic_like); 12];
+        assert!(checks
+            .iter()
+            .all(|check| check.state == UsageArithmeticKind::Missing));
+        let scale = |input_size| UsageScaleEvidence {
+            input_size,
+            relay_excess_tokens: vec![40.0; 6],
+            reference_excess_tokens: vec![1.0; 6],
+            tolerance_tokens: 8.0,
+        };
+        let assessment = assess_usage_padding(&checks, &[scale(256), scale(1_024)], seed(61));
+        assert_eq!(assessment.state, UsageAssessmentKind::SuspectedOvercount);
+        assert_eq!(assessment.factors.len(), 2);
+        assert!(assessment
+            .limitations
+            .iter()
+            .any(|limitation| limitation.contains("omitted an absolute total")));
+
+        let without_reference = assess_usage_padding(&checks, &[], seed(61));
+        assert_eq!(without_reference.state, UsageAssessmentKind::UsageMissing);
+    }
+
+    #[test]
+    fn anthropic_cache_components_are_additive_and_never_fail_openai_subset_rules() {
+        let usage = ReportedUsage {
+            input_tokens: Some(10),
+            cached_input_tokens: Some(500),
+            cache_creation_input_tokens: Some(250),
+            output_tokens: Some(4),
+            total_tokens: None,
+            ..ReportedUsage::default()
+        };
+        let anthropic =
+            check_usage_arithmetic_for_protocol(&usage, RelayProtocol::AnthropicMessages);
+        assert_eq!(anthropic.state, UsageArithmeticKind::Missing);
+        assert_eq!(anthropic.expected_min_total, Some(764));
+        assert!(!anthropic
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("exceed input")));
+
+        let openai = check_usage_arithmetic(&usage);
+        assert_eq!(openai.state, UsageArithmeticKind::ContractContradiction);
     }
 
     #[test]
@@ -2437,6 +2719,7 @@ mod tests {
         let request = RelayAuditRequest {
             profile_id: "relay".to_owned(),
             model: "gpt-5.6-sol".to_owned(),
+            effort: None,
             mode: AuditMode::Quick,
             official_baseline_profile_id: None,
             max_requests: 150,
@@ -2457,6 +2740,7 @@ mod tests {
             completed_at: None,
             parameters: AuditParametersSnapshot {
                 mode: request.mode,
+                effort: request.effort.clone(),
                 max_requests: request.max_requests,
                 max_input_tokens: request.max_input_tokens,
                 max_output_tokens: request.max_output_tokens,
@@ -2476,7 +2760,9 @@ mod tests {
             usage_reconciliation: consistent_usage(),
             quality_findings: consistent_quality(),
             fingerprint_findings: consistent_identity(),
+            anti_evasion_findings: AntiEvasionAssessment::default(),
             paired_baseline: None,
+            trusted_static_baseline: None,
             community_baseline: None,
             selective_service_assessment: None,
             overall_verdict: OverallVerdict::Consistent,
@@ -2511,6 +2797,7 @@ mod tests {
         let request = RelayAuditRequest {
             profile_id: "relay".to_owned(),
             model: "model".to_owned(),
+            effort: None,
             mode: AuditMode::Quick,
             official_baseline_profile_id: None,
             max_requests: 151,

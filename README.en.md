@@ -8,7 +8,7 @@
 
 > Current release: `v0.2.0-beta.1`. XiaoLi is an independent community project. It is not affiliated with or endorsed by OpenAI, Anthropic, or any model or relay provider. It is a beta-stage black-box and local-statistics tool and cannot guarantee error-free results.
 
-[中文](README.md) · [Portable downloads](https://github.com/XuYing1128/XiaoLi/releases) · [Workbench guide](docs/WORKBENCH.md) · [Relay-audit method](docs/RELAY_AUDIT.md) · [Community references](docs/COMMUNITY_BASELINES.en.md) · [Evidence reference](docs/STATUS_AND_EVIDENCE.md)
+[中文](README.md) · [Portable downloads](https://github.com/XuYing1128/XiaoLi/releases) · [Workbench guide](docs/WORKBENCH.md) · [Relay-audit method](docs/RELAY_AUDIT.md) · [Signed static baselines](docs/SIGNED_BASELINES.md) · [Community references](docs/COMMUNITY_BASELINES.en.md) · [Evidence reference](docs/STATUS_AND_EVIDENCE.md)
 
 ## What XiaoLi can verify
 
@@ -28,7 +28,7 @@ Open **XiaoLi Workbench** from the tray or compact-window menu:
 - **Overview** — active conversations, deduplicated token totals, origin classes, four audit axes, and recent alerts.
 - **Conversation history** — filter derived metrics by date, model, effort, origin, and status. Prompt and response bodies are not retained.
 - **Relay audit** — enter an endpoint you are authorized to test, select OpenAI Responses, OpenAI Chat Completions, or Anthropic Messages, test connectivity, review hard budgets, and explicitly start an audit.
-- **References** — inspect imported official/community/user summaries. Imported summaries remain metadata-only. Release-pinned public community distributions can provide only a low-confidence, cross-protocol experimental relative ranking and never change the overall verdict. Only a live official endpoint paired with the same protocol and exact model in the current audit can provide medium/high-confidence statistical reference evidence.
+- **References** — inspect imported official/community/user material. Plain or unverified summaries remain metadata-only. A user may explicitly import an independent Ed25519 trust anchor and then verify a package whose signature covers all applicability parameters and normalized cell distributions. A verified, matching, unexpired package is only a low-confidence static fingerprint reference when no live pair exists; it cannot by itself make the overall verdict consistent or prove a physical model. Only a live official endpoint paired with the same protocol and exact model in the current audit provides medium/high-confidence statistical reference evidence.
 - **Method and status** — an in-app explanation of the four evidence axes, green/yellow/red/gray states, and what each conclusion cannot prove.
 
 The workbench is a normal, non-topmost window and is separate from the small always-on-top monitor. Active audits have their own worker and never share the Codex collector's refresh lock.
@@ -42,7 +42,7 @@ XiaoLi deliberately does not produce a misleading “96% real model” score.
 | Protocol compatibility | Authentication, response envelope, SSE termination, self-reported model, and error-contract behavior | A correct API surface does not authenticate the physical backend |
 | Usage consistency | Usage arithmetic, subset invariants, controlled input sizes, and matched paired references when available | Hidden system prompts, reasoning, or provider wrappers can make a local absolute count unknowable |
 | Behavioral quality | Structured JSON, long-context nonce retrieval, arithmetic/constraints, multilingual tasks, real tool schemas, and same-request multi-message state retention | Tool checks score only allowlisted structured function names/string arguments, never execute calls, and do not retain raw response bodies; state retention is not proof across network sessions, and style, speed, or one task cannot establish degradation |
-| Model identity | The API-reported model name; with live official pairing, single-token distributions and statistical distance | Without a live official pair this axis is insufficient evidence; neither a fingerprint nor a reported name is a physical-model certificate |
+| Model identity | The API-reported model name; with live official pairing, single-token distributions and statistical distance; without a live pair, an explicitly selected verified/matching/unexpired signed package can provide a low-confidence static comparison | Neither a fingerprint, a package signature, nor a reported name is a physical-model certificate; a static-consistent result cannot by itself make the overall verdict consistent |
 
 Even a fully passing report says only: **no significant anomaly was found within this run's scope and reference conditions; the physical serving model was not cryptographically proven.**
 
@@ -75,11 +75,12 @@ Color is never the only signal. The windows and tray pair every color with a sym
 | --- | --- | --- |
 | Green · consistent with reference | No significant anomaly within this run and its matched reference conditions | Not a physical-model certificate |
 | Yellow · suspected padding/degradation/significant difference | Conservative multi-scale, multi-domain, or distribution thresholds were crossed | A reproducible suspicion, not proof of intent or a named replacement model |
+| Yellow · anti-evasion behavior anomaly | In standard/deep mode, at least two of response-distribution collapse, unusually low/stable latency, paraphrase drift, and role/format sensitivity persist across both independent batches | Independent behavior evidence only; it never changes the four axes, overall verdict, or model identity |
 | Yellow · suspected selective service | A consistent active audit conflicts with enough conservative degradation warnings from recent real turns bound to the same local profile | This is an independent statistical mismatch; it does not change the four axes or prove selective routing |
 | Red · confirmed contract mismatch | Reproducible impossible usage arithmetic, a wrong self-reported model, or a stable declared protocol contradiction | Establishes a contract contradiction, not the backend's identity |
 | Red · audit failed | No operation produced a parseable successful response, or the audit worker failed deterministically | No model-identity conclusion was formed |
 | Gray · cancelled | The user cancelled; no new request is started | Completed structured evidence may remain, but the run is not a pass |
-| Gray · insufficient evidence | Missing samples, no live matched reference, uncontrollable parameters, or an unsupported check | Gray is not a pass |
+| Gray · insufficient evidence | Missing samples, no applicable reference, uncontrollable parameters, or an unsupported check | Gray is not a pass |
 
 The same guide is built into the workbench under **Method and status**.
 
@@ -96,12 +97,12 @@ The same guide is built into the workbench under **Method and status**.
 
 | Mode | Scope | Hard request limit per endpoint |
 | --- | --- | ---: |
-| Connection | Authentication, basic response, SSE | 6 |
+| Connection | Authentication, target model catalog, basic non-streaming response, SSE | 6 (currently normally 3) |
 | Quick | 8 cells × 15, small samples in all six quality domains, plus basic protocol/usage checks | 150 |
 | Standard | 16 cells × 15, more samples in all six quality domains, plus full distribution comparison | 320 |
 | Deep | 40 cells × 15, higher sample counts in all six quality domains, plus the stability matrix | 720 |
 
-The UI displays request, input-token, output-token, and timeout caps before starting. A paired official comparison costs additional requests and requires a separately configured first-party profile with the same protocol and exact model plus its own credential. Without live pairing, XiaoLi can still check protocol behavior and usage arithmetic and collect six target-side deterministic probe domains, but relative quality stays learning/insufficient and model identity remains **insufficient evidence**. Imported summary metadata is never substituted for a live pair. Network attempts count against the cap.
+The UI displays request, input-token, output-token, and timeout caps before starting. A paired official comparison costs additional requests and requires a separately configured first-party profile with the same protocol and exact model plus its own credential. Without live pairing, XiaoLi can still check protocol behavior and usage arithmetic and collect six target-side deterministic probe domains; relative quality stays learning/insufficient. Model identity also stays **insufficient evidence** unless the user explicitly selects a verified, matching, unexpired signed static package. Such a package provides only a low-confidence `referenceConsistent` / `referenceDifferent` comparison: a consistent result cannot by itself make the overall verdict consistent and never proves the physical serving model. Imported summary metadata is never substituted for either a live pair or a verified scorer package. Network attempts count against the cap.
 
 An endpoint profile may optionally reference a local private probe-pack JSON file. XiaoLi persists only its canonical path, version, and SHA-256; task prompts and expected answers are read ephemerally at audit start. A missing or changed file fails before any network request. The confirmation dialog shows the pack's additional per-endpoint requests and conservative token allowance. Built-in and private cases are never silently truncated: if the complete randomized plan exceeds any confirmed hard cap, the audit refuses to start. See the strict schema and limits in the [relay-audit method](docs/RELAY_AUDIT.md#用户私有-probe-pack).
 
@@ -121,7 +122,7 @@ Relay output is untrusted data:
 - HTTP redirects are disabled, and credentials stay bound to the origin the user confirmed.
 - JSON/SSE event size, total response size, depth, and retained strings are bounded.
 - The UI renders untrusted values as text, not HTML.
-- Relay observations, live official-pair results, imported metadata, and release-pinned community distributions stay logically separate. Imported metadata does not enter the beta.1 scorer; built-in community distributions can only add low-confidence cross-protocol relative ranking and cannot change the four axes or overall verdict.
+- Relay observations, live official-pair results, unverified imported metadata, trusted signed packages, and release-pinned community distributions stay logically and physically separate. Only a user-selected verified/matching/unexpired signed package can enter the low-confidence static fingerprint scorer; built-in cross-protocol distributions still cannot change the four axes or overall verdict.
 
 A relay that recognizes all audit traffic through TLS or traffic shape can selectively forward an honest model. No black-box client can rule that out. XiaoLi raises the cost of evasion and preserves reproducible evidence; it does not promise an unbypassable proof.
 
@@ -195,7 +196,7 @@ xiaoli --stop
 - macOS: `~/Library/Application Support/XiaoLi`
 - Linux: `$XDG_DATA_HOME/xiaoli` or `~/.local/share/xiaoli`
 
-SQLite stores rebuildable cursors, derived conversation metrics, aggregates, imported reference-summary metadata, normalized relay profiles, and sanitized reports. A selected private probe pack contributes only its canonical local path, version, and SHA-256 to the profile/report; its body is not copied. Imported summaries do not enter beta.1 scoring. Release-pinned community distributions are compiled into the binary and contain normalized counts only, not prompt/reply bodies. SQLite does not store API keys, authentication tokens, prompt/reply bodies, full working-directory paths, or raw relay responses.
+SQLite stores rebuildable cursors, derived conversation metrics, aggregates, imported reference metadata, explicitly trusted public keys, verified normalized one-word count distributions, normalized relay profiles, and sanitized reports. A selected private probe pack contributes only its canonical local path, version, and SHA-256 to the profile/report; its body is not copied. Unverified summaries do not enter scoring. Trusted packages and relay samples use separate tables; packages are reverified and checked for expiry on load, and revoking a key removes its scoring packages. Release-pinned community distributions contain normalized counts only, not prompt/reply bodies. SQLite does not store API keys, authentication tokens, prompt/reply bodies, full working-directory paths, or raw relay responses.
 
 API keys are memory-only by default. Explicit opt-in uses Windows Credential Manager, macOS Keychain, or Linux Secret Service. If the OS credential store is unavailable, XiaoLi remains memory-only and shows a warning.
 

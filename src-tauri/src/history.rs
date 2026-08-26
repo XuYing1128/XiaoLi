@@ -1,5 +1,6 @@
 use crate::{
     connection::ConnectionOriginSnapshot,
+    metrics::cache_input_share,
     model::{ConversationSnapshot, StatusLevel, ThreadKind, TimingSnapshot, TokenUsage},
 };
 use serde::{Deserialize, Serialize};
@@ -98,8 +99,8 @@ impl ConversationHistoryRecord {
             route_evidence: value.server_route.evidence.clone(),
             routed_model: value.server_route.model.clone(),
             usage: HistoryUsage::from_token_usage(
-                &value.usage.cumulative,
-                value.usage.cache_input_share,
+                &value.usage.turn,
+                cache_input_share(&value.usage.turn),
             ),
             timing: value.timing.clone(),
             status_level: value.status.level,
@@ -234,6 +235,79 @@ mod tests {
             );
         }
         assert_eq!(history.display_label, "2026-08-27T01:02 · thread-p");
+    }
+
+    #[test]
+    fn history_uses_turn_local_usage_without_recounting_prior_turns() {
+        let mut conversation = ConversationSnapshot {
+            thread_id: "thread-shared".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            parent_thread_id: None,
+            kind: ThreadKind::Root,
+            title: "live only".to_owned(),
+            source_timestamp: Some("2026-08-27T01:00:00Z".to_owned()),
+            active_request: RequestSnapshot::new(
+                Some("gpt-5.6-sol".to_owned()),
+                Some("ultra".to_owned()),
+                "turnContext",
+            ),
+            pending_next_turn: None,
+            server_route: ServerRouteSnapshot::default(),
+            usage: UsageSnapshot {
+                cumulative: TokenUsage {
+                    input_tokens: 90_000,
+                    cached_input_tokens: 80_000,
+                    output_tokens: 10_000,
+                    total_tokens: 100_000,
+                    ..TokenUsage::default()
+                },
+                turn: TokenUsage {
+                    input_tokens: 90_000,
+                    cached_input_tokens: 80_000,
+                    output_tokens: 10_000,
+                    total_tokens: 100_000,
+                    ..TokenUsage::default()
+                },
+                ..UsageSnapshot::default()
+            },
+            timing: TimingSnapshot::default(),
+            quality_assessment: QualityAssessment::default(),
+            connection_origin: ConnectionOriginSnapshot::unknown(),
+            tool_activity: false,
+            status: StatusSnapshot {
+                level: StatusLevel::Green,
+                code: "ok".to_owned(),
+                explanation: "ok".to_owned(),
+            },
+            anomalies: Vec::new(),
+        };
+        let first = ConversationHistoryRecord::from_live(&conversation, "2026-08-27T01:02:00Z");
+
+        conversation.turn_id = "turn-2".to_owned();
+        conversation.usage.cumulative = TokenUsage {
+            input_tokens: 160_000,
+            cached_input_tokens: 145_000,
+            output_tokens: 20_000,
+            total_tokens: 180_000,
+            ..TokenUsage::default()
+        };
+        conversation.usage.turn = TokenUsage {
+            input_tokens: 70_000,
+            cached_input_tokens: 65_000,
+            output_tokens: 10_000,
+            total_tokens: 80_000,
+            ..TokenUsage::default()
+        };
+        let second = ConversationHistoryRecord::from_live(&conversation, "2026-08-27T01:04:00Z");
+
+        assert_eq!(first.usage.total_tokens, 100_000);
+        assert_eq!(second.usage.total_tokens, 80_000);
+        assert_eq!(
+            first.usage.total_tokens + second.usage.total_tokens,
+            180_000,
+            "cross-turn totals must equal the thread total without recounting turn 1"
+        );
+        assert_eq!(second.usage.cache_input_share, Some(65_000.0 / 70_000.0));
     }
 
     #[test]

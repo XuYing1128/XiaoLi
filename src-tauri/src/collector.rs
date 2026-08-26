@@ -634,6 +634,7 @@ impl RolloutCollector {
         let usage = usage_snapshot(
             turn.usage_last.clone(),
             turn.usage_cumulative.clone(),
+            turn.usage_turn.clone(),
             turn.context_window,
         );
         let timing = timing_snapshot(
@@ -2072,6 +2073,9 @@ mod tests {
         assert_eq!(usage.cumulative.reasoning_output_tokens, 14);
         assert_eq!(usage.cumulative.total_tokens, 185);
         assert_eq!(usage.last.total_tokens, 65);
+        assert_eq!(usage.turn.total_tokens, 65);
+        assert_eq!(usage.turn.cached_input_tokens, 40);
+        assert!(serde_json::to_value(usage).unwrap().get("turn").is_none());
 
         append(
             &path,

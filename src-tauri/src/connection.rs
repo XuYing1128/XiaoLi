@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,6 +101,11 @@ pub struct ConnectionOriginInput<'a> {
     pub session_provider_id: Option<&'a str>,
     pub provider_base_url: Option<&'a str>,
     pub openai_base_url: Option<&'a str>,
+    /// True even when an explicitly configured value was malformed and could
+    /// not be retained as a sanitized URL.
+    pub provider_base_url_declared: bool,
+    /// True even when an explicit OpenAI override was malformed.
+    pub openai_base_url_declared: bool,
     pub auth_mode: ConnectionAuthMode,
     pub hook_endpoint_class: Option<EndpointClass>,
 }
@@ -117,6 +122,8 @@ pub struct ParsedCodexConnectionConfig {
     pub provider_base_url: Option<String>,
     pub openai_base_url: Option<String>,
     provider_base_urls: BTreeMap<String, String>,
+    provider_base_url_declarations: BTreeSet<String>,
+    openai_base_url_declared: bool,
 }
 
 impl ParsedCodexConnectionConfig {
@@ -134,6 +141,13 @@ impl ParsedCodexConnectionConfig {
                     .then_some(self.provider_base_url.as_deref())
                     .flatten()
             })
+    }
+
+    pub fn provider_base_url_declared_for(&self, provider_id: Option<&str>) -> bool {
+        provider_id
+            .and_then(sanitize_provider_id)
+            .or_else(|| self.model_provider.clone())
+            .is_some_and(|provider| self.provider_base_url_declarations.contains(&provider))
     }
 }
 
@@ -229,27 +243,45 @@ pub fn classify_connection_origin(input: ConnectionOriginInput<'_>) -> Connectio
         };
     }
 
-    let (endpoint_class, endpoint_confidence) = match configured_endpoint.or(hook_endpoint) {
-        Some(endpoint) => {
-            let confidence = if configured_endpoint.is_some() {
-                ConnectionOriginConfidence::Configured
-            } else {
-                ConnectionOriginConfidence::Partial
-            };
-            (endpoint, confidence)
+    // Codex's built-in `openai` provider normally omits a base URL because the
+    // destination is selected internally from the authentication mode. Treat
+    // that exact, override-free configuration as first-party evidence. This is
+    // intentionally narrower than `ProviderFamily::OpenAi`: aliases and any
+    // explicit config/hook evidence must still be classified on their own.
+    let implicit_builtin_endpoint = if is_builtin_openai_provider(input.session_provider_id)
+        && input.provider_base_url.is_none()
+        && input.openai_base_url.is_none()
+        && !input.provider_base_url_declared
+        && !input.openai_base_url_declared
+        && input.hook_endpoint_class.is_none()
+    {
+        match input.auth_mode {
+            ConnectionAuthMode::ChatGpt => Some(EndpointClass::OfficialChatGpt),
+            ConnectionAuthMode::ApiKey => Some(EndpointClass::OfficialOpenAi),
+            ConnectionAuthMode::External | ConnectionAuthMode::Unknown => None,
         }
-        None => {
-            push_unique(&mut limitations, "endpointMissing");
-            return ConnectionOriginSnapshot {
-                kind: ConnectionOriginKind::Unknown,
-                auth_mode: input.auth_mode,
-                confidence: ConnectionOriginConfidence::Unknown,
-                provider_id,
-                endpoint_class: EndpointClass::Unknown,
-                evidence,
-                limitations,
-            };
-        }
+    } else {
+        None
+    };
+
+    let (endpoint_class, endpoint_confidence) = if let Some(endpoint) = configured_endpoint {
+        (endpoint, ConnectionOriginConfidence::Configured)
+    } else if let Some(endpoint) = hook_endpoint {
+        (endpoint, ConnectionOriginConfidence::Partial)
+    } else if let Some(endpoint) = implicit_builtin_endpoint {
+        push_unique(&mut evidence, "builtinProviderDefaultEndpoint");
+        (endpoint, ConnectionOriginConfidence::Configured)
+    } else {
+        push_unique(&mut limitations, "endpointMissing");
+        return ConnectionOriginSnapshot {
+            kind: ConnectionOriginKind::Unknown,
+            auth_mode: input.auth_mode,
+            confidence: ConnectionOriginConfidence::Unknown,
+            provider_id,
+            endpoint_class: EndpointClass::Unknown,
+            evidence,
+            limitations,
+        };
     };
 
     let (kind, confidence) = match endpoint_class {
@@ -311,11 +343,16 @@ pub fn resolve_connection_origin(
         session_provider_id.or_else(|| config.and_then(|parsed| parsed.model_provider.as_deref()));
     let provider_base_url = config.and_then(|parsed| parsed.provider_base_url_for(provider_id));
     let openai_base_url = config.and_then(|parsed| parsed.openai_base_url.as_deref());
+    let provider_base_url_declared =
+        config.is_some_and(|parsed| parsed.provider_base_url_declared_for(provider_id));
+    let openai_base_url_declared = config.is_some_and(|parsed| parsed.openai_base_url_declared);
 
     classify_connection_origin(ConnectionOriginInput {
         session_provider_id: provider_id,
         provider_base_url,
         openai_base_url,
+        provider_base_url_declared,
+        openai_base_url_declared,
         auth_mode,
         hook_endpoint_class,
     })
@@ -358,6 +395,8 @@ pub fn parse_codex_connection_config(config_toml: &str) -> ParsedCodexConnection
     let mut selected_provider = None;
     let mut openai_base_url = None;
     let mut provider_urls = BTreeMap::<String, String>::new();
+    let mut provider_url_declarations = BTreeSet::<String>::new();
+    let mut openai_base_url_declared = false;
     let mut current_provider_section = None::<String>;
 
     for raw_line in config_toml.lines() {
@@ -375,6 +414,23 @@ pub fn parse_codex_connection_config(config_toml: &str) -> ParsedCodexConnection
             continue;
         };
         let key = raw_key.trim();
+
+        // Presence itself is security-relevant: a malformed explicit override
+        // must block the implicit first-party default instead of disappearing
+        // during URL sanitization.
+        if let Some(provider) = current_provider_section.as_ref() {
+            if key == "base_url" {
+                provider_url_declarations.insert(provider.clone());
+            }
+        } else if key == "openai_base_url" {
+            openai_base_url_declared = true;
+        } else if let Some(provider) = dotted_provider_base_url_key(key)
+            .as_deref()
+            .and_then(sanitize_provider_id)
+        {
+            provider_url_declarations.insert(provider);
+        }
+
         let Some(value) = parse_toml_string(raw_value.trim()) else {
             continue;
         };
@@ -395,11 +451,10 @@ pub fn parse_codex_connection_config(config_toml: &str) -> ParsedCodexConnection
             }
             _ => {
                 if let Some(provider) = dotted_provider_base_url_key(key) {
-                    if let (Some(provider), Some(origin)) = (
-                        sanitize_provider_id(&provider),
-                        sanitize_endpoint_origin(&value),
-                    ) {
-                        provider_urls.insert(provider, origin);
+                    if let Some(provider) = sanitize_provider_id(&provider) {
+                        if let Some(origin) = sanitize_endpoint_origin(&value) {
+                            provider_urls.insert(provider, origin);
+                        }
                     }
                 }
             }
@@ -415,6 +470,8 @@ pub fn parse_codex_connection_config(config_toml: &str) -> ParsedCodexConnection
         provider_base_url,
         openai_base_url,
         provider_base_urls: provider_urls,
+        provider_base_url_declarations: provider_url_declarations,
+        openai_base_url_declared,
     }
 }
 
@@ -451,6 +508,12 @@ fn provider_family(value: &str) -> ProviderFamily {
         }
         _ => ProviderFamily::Other,
     }
+}
+
+fn is_builtin_openai_provider(value: Option<&str>) -> bool {
+    value
+        .map(normalize_identifier)
+        .is_some_and(|provider| provider == "openai")
 }
 
 fn provider_endpoint_conflicts(family: ProviderFamily, endpoint: EndpointClass) -> bool {
@@ -851,12 +914,84 @@ mod tests {
     }
 
     #[test]
-    fn returns_unknown_when_endpoint_is_missing() {
+    fn classifies_builtin_openai_default_for_chatgpt_auth() {
+        let parsed = parse_codex_connection_config("model_provider = \"openai\"");
         let result =
-            classify_connection_origin(input(Some("openai"), None, ConnectionAuthMode::ApiKey));
+            resolve_connection_origin(Some(&parsed), None, ConnectionAuthMode::ChatGpt, None);
+        assert_eq!(result.kind, ConnectionOriginKind::OfficialChatGpt);
+        assert_eq!(result.endpoint_class, EndpointClass::OfficialChatGpt);
+        assert_eq!(result.confidence, ConnectionOriginConfidence::Configured);
+        assert!(result
+            .evidence
+            .contains(&"builtinProviderDefaultEndpoint".to_owned()));
+    }
+
+    #[test]
+    fn classifies_builtin_openai_default_for_api_key_auth() {
+        let parsed = parse_codex_connection_config("model_provider = \"openai\"");
+        let result =
+            resolve_connection_origin(Some(&parsed), None, ConnectionAuthMode::ApiKey, None);
+        assert_eq!(result.kind, ConnectionOriginKind::OfficialOpenAiApi);
+        assert_eq!(result.endpoint_class, EndpointClass::OfficialOpenAi);
+        assert_eq!(result.confidence, ConnectionOriginConfidence::Configured);
+    }
+
+    #[test]
+    fn builtin_openai_without_matching_auth_remains_unknown() {
+        let result =
+            classify_connection_origin(input(Some("openai"), None, ConnectionAuthMode::External));
         assert_eq!(result.kind, ConnectionOriginKind::Unknown);
         assert_eq!(result.confidence, ConnectionOriginConfidence::Unknown);
         assert!(result.limitations.contains(&"endpointMissing".to_owned()));
+    }
+
+    #[test]
+    fn builtin_openai_explicit_custom_override_is_custom() {
+        let result = classify_connection_origin(ConnectionOriginInput {
+            session_provider_id: Some("openai"),
+            openai_base_url: Some("https://relay.example/v1"),
+            auth_mode: ConnectionAuthMode::ApiKey,
+            ..ConnectionOriginInput::default()
+        });
+        assert_eq!(result.kind, ConnectionOriginKind::CustomEndpoint);
+        assert_eq!(result.endpoint_class, EndpointClass::CustomEndpoint);
+        assert!(!result
+            .evidence
+            .contains(&"builtinProviderDefaultEndpoint".to_owned()));
+    }
+
+    #[test]
+    fn builtin_openai_hook_environment_override_is_custom() {
+        let result = classify_connection_origin(ConnectionOriginInput {
+            session_provider_id: Some("openai"),
+            auth_mode: ConnectionAuthMode::ApiKey,
+            hook_endpoint_class: Some(EndpointClass::CustomEndpoint),
+            ..ConnectionOriginInput::default()
+        });
+        assert_eq!(result.kind, ConnectionOriginKind::CustomEndpoint);
+        assert_eq!(result.endpoint_class, EndpointClass::CustomEndpoint);
+        assert_eq!(result.confidence, ConnectionOriginConfidence::Partial);
+    }
+
+    #[test]
+    fn malformed_explicit_override_cannot_fall_back_to_builtin_official() {
+        let parsed = parse_codex_connection_config(
+            r#"
+model_provider = "openai"
+openai_base_url = "not an endpoint"
+"#,
+        );
+        let result =
+            resolve_connection_origin(Some(&parsed), None, ConnectionAuthMode::ChatGpt, None);
+        assert_eq!(result.kind, ConnectionOriginKind::Unknown);
+        assert!(result.limitations.contains(&"endpointMissing".to_owned()));
+    }
+
+    #[test]
+    fn openai_alias_without_endpoint_cannot_claim_builtin_default() {
+        let result =
+            classify_connection_origin(input(Some("openai-api"), None, ConnectionAuthMode::ApiKey));
+        assert_eq!(result.kind, ConnectionOriginKind::Unknown);
     }
 
     #[test]
@@ -896,6 +1031,7 @@ mod tests {
             openai_base_url: Some("https://relay.example/v1"),
             auth_mode: ConnectionAuthMode::ApiKey,
             hook_endpoint_class: Some(EndpointClass::CustomEndpoint),
+            ..ConnectionOriginInput::default()
         });
         assert_eq!(result.kind, ConnectionOriginKind::CustomEndpoint);
         assert_eq!(result.endpoint_class, EndpointClass::CustomEndpoint);
@@ -909,6 +1045,7 @@ mod tests {
             openai_base_url: Some("https://relay-for-openai.example/v1"),
             auth_mode: ConnectionAuthMode::ApiKey,
             hook_endpoint_class: None,
+            ..ConnectionOriginInput::default()
         });
         assert_eq!(result.kind, ConnectionOriginKind::OfficialAnthropicApi);
     }

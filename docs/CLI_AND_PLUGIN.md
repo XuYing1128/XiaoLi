@@ -64,7 +64,7 @@ Windows PowerShell 示例：
 - 请求模型。
 - 时间戳。
 
-请求 effort 不在 hook 脱敏包中，由 rollout 的结构化 `turn_context` 作为请求证据。hook 通过当前用户 IPC 端点发送给 GUI。150ms 内连接失败会 fail-open，返回合法 hook 响应并让 Codex 正常继续。不会保存 prompt、回复正文或完整 cwd。
+请求 effort 不在 hook 脱敏包中，由 rollout 的结构化 `turn_context` 作为请求证据。`--hook-capture` 不访问网络，只通过当前用户本地 IPC 端点发送给 GUI。从 hook 处理入口开始，标准输入读取、JSON 解析、本地 IPC 和原子 fallback 写入共享同一个单调时钟 150ms 硬上限；输入元数据上限是 256 KiB。超时、超大、慢输入、IPC 卡住或慢磁盘都会 fail-open，返回合法 hook 响应并让 Codex 正常继续。插件 manifest 中的宿主 `timeout` 仅是第二道兜底，不是 150ms 保证的主要实现。小狸不会保存 prompt、回复正文或完整 cwd。
 
 ### `xiaoli --mcp-server`
 

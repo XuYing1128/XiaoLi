@@ -68,6 +68,9 @@ function historyEntry(id: string, displayName: string) {
 let previewResult: Record<string, unknown>;
 let startResult: Promise<unknown> | unknown;
 let historyGeneration: "initial" | "refreshed";
+let auditReports: unknown[];
+let baselineRows: unknown[];
+let baselineTrustAnchors: unknown[];
 
 function defaultPreview(overrides: Record<string, unknown> = {}) {
   return {
@@ -117,9 +120,18 @@ function installInvokeFixture(): void {
       case "list_relay_profiles":
         return { profiles: [relayProfile] };
       case "list_relay_audits":
-        return { audits: [], activeRuns: [] };
+        return { audits: auditReports, activeRuns: [] };
+      case "get_relay_audit":
+        return {
+          report: auditReports.find((report) => {
+            const record = report as Record<string, unknown>;
+            return record.auditId === args?.auditId || record.audit_id === args?.auditId;
+          }) ?? auditReports[0],
+        };
       case "list_relay_baselines":
-        return { baselines: [], builtInCommunityBaselines: [] };
+        return { baselines: baselineRows, builtInCommunityBaselines: [] };
+      case "list_relay_baseline_trust_anchors":
+        return { trustAnchors: baselineTrustAnchors };
       case "get_audit_schedule":
         return baseSchedule;
       case "upsert_relay_profile":
@@ -134,7 +146,7 @@ function installInvokeFixture(): void {
   });
 }
 
-async function boot(page: "relay" | "history" = "relay"): Promise<void> {
+async function boot(page: "relay" | "history" | "baselines" = "relay"): Promise<void> {
   window.history.replaceState(null, "", `/workbench.html?page=${page}`);
   Object.defineProperty(window, "__TAURI_INTERNALS__", {
     value: {},
@@ -179,6 +191,9 @@ beforeEach(() => {
   tauri.listen.mockClear();
   tauri.listeners.clear();
   historyGeneration = "initial";
+  auditReports = [];
+  baselineRows = [];
+  baselineTrustAnchors = [];
   previewResult = defaultPreview();
   startResult = {
     auditId: "audit-default",
@@ -203,6 +218,324 @@ afterEach(() => {
 });
 
 describe("XiaoLi workbench audit safeguards", () => {
+  it("offers only verified usable exact-match static baselines and sends the selected id without doubling requests", async () => {
+    baselineRows = [
+      {
+        id: "trusted-static-match",
+        label: "已验证匹配包",
+        model: relayProfile.defaultModel,
+        protocol: relayProfile.protocol,
+        source: "community",
+        sampleCount: 400,
+        signed: true,
+        signatureVerified: true,
+        usableForScoring: true,
+        signingKeyId: "release-key",
+      },
+      {
+        id: "trusted-static-expired",
+        label: "已验签但过期",
+        model: relayProfile.defaultModel,
+        protocol: relayProfile.protocol,
+        source: "community",
+        sampleCount: 400,
+        signed: true,
+        signatureVerified: true,
+        usableForScoring: false,
+      },
+      {
+        id: "unverified-static",
+        label: "未验证包",
+        model: relayProfile.defaultModel,
+        protocol: relayProfile.protocol,
+        source: "user",
+        sampleCount: 400,
+        signed: true,
+        signatureVerified: false,
+        usableForScoring: false,
+      },
+    ];
+    await boot();
+    prepareRelayDraft();
+
+    const staticSelect = document.querySelector<HTMLSelectElement>("#audit-static-baseline");
+    expect(staticSelect).not.toBeNull();
+    expect([...staticSelect!.options].map((option) => option.value)).toEqual([
+      "",
+      "trusted-static-match",
+    ]);
+    staticSelect!.value = "trusted-static-match";
+    staticSelect!.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(document.querySelector<HTMLSelectElement>("#audit-baseline")?.disabled).toBe(true);
+
+    click('[data-action="audit-start"]');
+    await vi.waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith(
+        "start_relay_audit",
+        expect.objectContaining({
+          request: expect.objectContaining({
+            trustedStaticBaselineId: "trusted-static-match",
+            officialBaselineProfileId: undefined,
+          }),
+        }),
+      );
+    });
+    expect(vi.mocked(window.confirm).mock.calls.at(-1)?.[0]).toContain(
+      "签名静态参考：已验证匹配包（低置信身份轴；不增加请求）",
+    );
+    expect(vi.mocked(window.confirm).mock.calls.at(-1)?.[0]).toContain(
+      "140 次总操作",
+    );
+  });
+
+  it("binds optional effort to preview, start, confirmation, and exact static-baseline selection", async () => {
+    baselineRows = [
+      {
+        id: "trusted-static-high",
+        label: "high 匹配包",
+        model: relayProfile.defaultModel,
+        effort: "high",
+        protocol: relayProfile.protocol,
+        source: "community",
+        sampleCount: 400,
+        signed: true,
+        signatureVerified: true,
+        usableForScoring: true,
+      },
+      {
+        id: "trusted-static-default",
+        label: "未设置 effort 包",
+        model: relayProfile.defaultModel,
+        protocol: relayProfile.protocol,
+        source: "community",
+        sampleCount: 400,
+        signed: true,
+        signatureVerified: true,
+        usableForScoring: true,
+      },
+    ];
+    await boot();
+    prepareRelayDraft();
+
+    const effort = document.querySelector<HTMLSelectElement>("#audit-effort")!;
+    effort.value = "high";
+    effort.dispatchEvent(new Event("change", { bubbles: true }));
+    const staticSelect = document.querySelector<HTMLSelectElement>("#audit-static-baseline")!;
+    expect([...staticSelect.options].map((option) => option.value)).toEqual(["", "trusted-static-high"]);
+    staticSelect.value = "trusted-static-high";
+    staticSelect.dispatchEvent(new Event("change", { bubbles: true }));
+
+    click('[data-action="audit-start"]');
+    await vi.waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith(
+        "preview_relay_audit_plan",
+        expect.objectContaining({ request: expect.objectContaining({ effort: "high" }) }),
+      );
+      expect(tauri.invoke).toHaveBeenCalledWith(
+        "start_relay_audit",
+        expect.objectContaining({ request: expect.objectContaining({ effort: "high", trustedStaticBaselineId: "trusted-static-high" }) }),
+      );
+    });
+    expect(vi.mocked(window.confirm).mock.calls.at(-1)?.[0]).toContain("请求 effort：high（请求）");
+  });
+
+  it("disables and clears effort immediately for Anthropic Messages", async () => {
+    await boot();
+    prepareRelayDraft();
+    const effort = document.querySelector<HTMLSelectElement>("#audit-effort")!;
+    effort.value = "ultra";
+    effort.dispatchEvent(new Event("change", { bubbles: true }));
+    const protocol = document.querySelector<HTMLSelectElement>("#relay-protocol")!;
+    protocol.value = "anthropicMessages";
+    protocol.dispatchEvent(new Event("change", { bubbles: true }));
+
+    expect(effort.value).toBe("");
+    expect(effort.disabled).toBe(true);
+    expect(document.querySelector(".audit-effort-help")?.textContent).toContain("不支持 OpenAI reasoning effort");
+    expect(document.querySelector(".notice-text")?.textContent).toContain("已清除该请求参数");
+  });
+
+  it("labels a verified but unusable baseline as metadata instead of scorer-ready", async () => {
+    baselineRows = [{
+      id: "trusted-static-expired",
+      label: "已验签但过期",
+      model: relayProfile.defaultModel,
+      protocol: relayProfile.protocol,
+      source: "community",
+      sampleCount: 400,
+      signed: true,
+      signatureVerified: true,
+      usableForScoring: false,
+      expiresAt: "2026-01-01T00:00:00Z",
+    }];
+    await boot("baselines");
+    const row = document.querySelector<HTMLElement>(".baseline-row");
+    expect(row?.textContent).toContain("仅元数据");
+    expect(row?.textContent).not.toContain("低置信 scorer");
+    expect(row?.title).toContain("不交给 scorer");
+  });
+
+  it("renders anti-evasion absolute and delta thresholds as localized independent evidence", async () => {
+    auditReports = [{
+      auditId: "audit-anti-evasion-ui",
+      profileId: relayProfile.id,
+      profileLabel: relayProfile.label,
+      claimedModel: relayProfile.defaultModel,
+      protocol: relayProfile.protocol,
+      overallVerdict: "consistent",
+      confidence: "medium",
+      protocolFindings: { state: "compatible" },
+      usageReconciliation: { state: "consistent" },
+      qualityFindings: { state: "consistent" },
+      fingerprintFindings: { state: "referenceConsistent" },
+      antiEvasionFindings: {
+        state: "suspiciousBehavior",
+        persistentSignals: ["cacheDistributionCollapse", "paraphraseDrift"],
+        factors: [{
+          batchId: "anti-evasion-batch-0",
+          signal: "cacheDistributionCollapse",
+          pairedSamples: 40,
+          targetPrimary: 0.86,
+          referencePrimary: 0.32,
+          primaryThreshold: 0.75,
+          secondaryThreshold: 0.30,
+          suspicious: true,
+        }, {
+          batchId: "anti-evasion-batch-0",
+          signal: "suspiciouslyLowStableLatency",
+          pairedSamples: 40,
+          targetPrimary: 20,
+          referencePrimary: 100,
+          targetSecondary: 1,
+          referenceSecondary: 4,
+          primaryThreshold: 0.35,
+          secondaryThreshold: 0.25,
+          suspicious: true,
+        }],
+        reasons: ["backend English reason must not be rendered"],
+        limitations: ["backend English limitation must not be rendered"],
+      },
+      reasons: [],
+      limitations: [],
+    }];
+    await boot();
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-action="report-detail"][data-audit-id="audit-anti-evasion-ui"]')).not.toBeNull();
+    });
+    click('[data-action="report-detail"][data-audit-id="audit-anti-evasion-ui"]');
+    await vi.waitFor(() => {
+      const copy = document.querySelector(".report-dialog-body")?.textContent ?? "";
+      expect(copy).toContain("抗规避行为检查（独立证据）");
+      expect(copy).toContain("中转需 ≥ 75%");
+      expect(copy).toContain("差值需 ≥ 30%");
+      expect(copy).toContain("参考 MAD × 25%");
+      expect(copy).toContain("2ms 下限");
+      expect(copy).not.toContain("backend English");
+    });
+  });
+
+  it("labels a signed static fingerprint comparison as low-confidence static evidence, never live pairing", async () => {
+    auditReports = [{
+      auditId: "audit-static-wording",
+      profileId: relayProfile.id,
+      profileLabel: relayProfile.label,
+      claimedModel: relayProfile.defaultModel,
+      protocol: relayProfile.protocol,
+      overallVerdict: "insufficientEvidence",
+      confidence: "low",
+      protocolFindings: { state: "normal" },
+      usageReconciliation: { state: "insufficientEvidence" },
+      qualityFindings: { state: "learning" },
+      fingerprintFindings: { state: "referenceConsistent", reasons: [], limitations: [] },
+      trustedStaticBaseline: {
+        baselineId: "trusted-static-match",
+        model: relayProfile.defaultModel,
+        protocol: relayProfile.protocol,
+        version: "2026.08",
+        signingKeyId: "release-key",
+        confidence: "low",
+      },
+      reasons: [],
+      limitations: [],
+    }];
+    await boot();
+    click('[data-action="report-detail"][data-audit-id="audit-static-wording"]');
+    await vi.waitFor(() => {
+      const copy = document.querySelector(".report-dialog-body")?.textContent ?? "";
+      expect(copy).toContain("与已验签静态参考一致 · 低置信");
+      expect(copy).toContain("不是本次实时官方配对");
+      expect(copy).not.toContain("与配对参考行为一致");
+    });
+  });
+
+  it("explains trusted static identity evidence on the principles page", async () => {
+    await boot();
+    click('[data-page="principles"]');
+    await vi.waitFor(() => {
+      const copy = document.body.textContent ?? "";
+      expect(copy).toContain("与已验签静态参考一致（低置信）");
+      expect(copy).toContain("静态一致不能单独令总裁决为正常");
+      expect(copy).toContain("可用的可信签名静态参考");
+    });
+  });
+
+  it("keeps the paired-reference wording for a live official paired audit", async () => {
+    auditReports = [{
+      auditId: "audit-live-paired-wording",
+      profileId: relayProfile.id,
+      profileLabel: relayProfile.label,
+      claimedModel: relayProfile.defaultModel,
+      protocol: relayProfile.protocol,
+      parameters: { effort: "high" },
+      overallVerdict: "consistent",
+      confidence: "medium",
+      protocolFindings: { state: "normal" },
+      usageReconciliation: { state: "consistent" },
+      qualityFindings: { state: "consistent" },
+      fingerprintFindings: { state: "referenceConsistent", reasons: [], limitations: [] },
+      pairedBaseline: {
+        profileId: "official-reference",
+        model: relayProfile.defaultModel,
+        protocol: relayProfile.protocol,
+        completedCases: 240,
+      },
+      reasons: [],
+      limitations: [],
+    }];
+    await boot();
+    click('[data-action="report-detail"][data-audit-id="audit-live-paired-wording"]');
+    await vi.waitFor(() => {
+      const copy = document.querySelector(".report-dialog-body")?.textContent ?? "";
+      expect(copy).toContain("本次参数下与配对参考行为一致");
+      expect(copy).toContain("请求 effort high（请求）");
+      expect(copy).not.toContain("与已验签静态参考一致");
+    });
+  });
+
+  it("renders request effort as not applicable for Anthropic reports", async () => {
+    auditReports = [{
+      auditId: "audit-anthropic-effort",
+      profileId: relayProfile.id,
+      profileLabel: "Anthropic 中转",
+      claimedModel: "claude-test",
+      protocol: "anthropicMessages",
+      parameters: {},
+      overallVerdict: "insufficientEvidence",
+      confidence: "low",
+      protocolFindings: { state: "normal" },
+      usageReconciliation: { state: "usageMissing" },
+      qualityFindings: { state: "learning" },
+      fingerprintFindings: { state: "unproven" },
+      reasons: [],
+      limitations: [],
+    }];
+    await boot();
+    click('[data-action="report-detail"][data-audit-id="audit-anthropic-effort"]');
+    await vi.waitFor(() => {
+      expect(document.querySelector(".report-dialog-body")?.textContent).toContain("请求 effort 不适用（Anthropic Messages）");
+    });
+  });
+
   it("previews the complete plan and never starts when the plan exceeds its declared budget", async () => {
     previewResult = defaultPreview({
       plannedRequests: 151,

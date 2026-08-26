@@ -7,8 +7,8 @@
 //! supplied by the caller.
 
 use crate::relay_audit::{
-    is_strict_model_id, safe_model_id, AnthropicThinkingFinding, AnthropicThinkingMetadata,
-    RelayProtocol, ReportedUsage, SafeResponseMetadata,
+    is_strict_model_id, normalize_audit_effort, safe_model_id, AnthropicThinkingFinding,
+    AnthropicThinkingMetadata, RelayProtocol, ReportedUsage, SafeResponseMetadata,
 };
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{
@@ -163,6 +163,14 @@ impl RelayTransportRequest {
                 ));
             }
         }
+        normalize_audit_effort(self.reasoning_effort.as_deref())
+            .map_err(RelayTransportError::InvalidRequest)?;
+        if self.protocol == RelayProtocol::AnthropicMessages && self.reasoning_effort.is_some() {
+            return Err(RelayTransportError::InvalidRequest(
+                "Anthropic Messages does not support the OpenAI reasoning effort parameter"
+                    .to_owned(),
+            ));
+        }
         validate_audit_messages(&self.audit_messages)?;
         if let Some(tool) = &self.audit_tool {
             validate_audit_tool(tool)?;
@@ -282,6 +290,31 @@ pub struct RelayTransportResult {
     pub(crate) tool_call: Option<SanitizedToolCall>,
     pub latency: RelayLatency,
     pub response_bytes: usize,
+}
+
+/// Bounded evidence returned by the provider's model-directory endpoint.
+/// Model identifiers from the response are compared in memory and discarded;
+/// only the requested identifier's exact-match result and the entry count are
+/// allowed to leave the transport.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RelayModelCatalogState {
+    TargetListed,
+    TargetNotListed,
+    PartialCatalog,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayModelCatalogProbe {
+    pub state: RelayModelCatalogState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_listed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_count: Option<u32>,
+    pub http_status: u16,
+    pub latency_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -481,6 +514,155 @@ impl RelayTransport {
             response_bytes: read.total_bytes,
         })
     }
+
+    /// Checks the provider model directory with the same redirect, timeout,
+    /// credential, and response-size boundaries as generation requests.
+    ///
+    /// OpenAI and Anthropic both document `GET /v1/models`. Some compatible
+    /// relays intentionally omit it; 404/405/501 are therefore returned as an
+    /// explicit `Unsupported` result so callers can distinguish "not checked"
+    /// from "checked and absent". A successful generation may subsequently
+    /// establish target-model availability, but it must not be reported as a
+    /// successful directory lookup.
+    pub fn probe_model_catalog(
+        &self,
+        protocol: RelayProtocol,
+        base_url: &str,
+        api_key: Option<&str>,
+        target_model: &str,
+        timeout_ms: u64,
+        cancelled: &AtomicBool,
+    ) -> Result<RelayModelCatalogProbe, RelayTransportError> {
+        if !is_strict_model_id(target_model) {
+            return Err(RelayTransportError::InvalidRequest(
+                "model must be a strict provider model identifier".to_owned(),
+            ));
+        }
+        if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
+            return Err(RelayTransportError::InvalidRequest(
+                "timeoutMs is outside the supported range".to_owned(),
+            ));
+        }
+        ensure_not_cancelled(cancelled)?;
+
+        let base_url = parse_safe_base_url(base_url)?;
+        let endpoint = model_catalog_endpoint(&base_url, protocol)?;
+        let original_origin =
+            Origin::from_url(&endpoint).ok_or(RelayTransportError::InvalidBaseUrl)?;
+        let mut builder = self
+            .client
+            .get(endpoint)
+            .timeout(Duration::from_millis(timeout_ms))
+            .header(ACCEPT, "application/json");
+
+        if let Some(api_key) = api_key.filter(|value| !value.is_empty()) {
+            let credential = HeaderValue::from_str(api_key)
+                .map_err(|_| RelayTransportError::InvalidCredential)?;
+            builder = match protocol {
+                RelayProtocol::AnthropicMessages => builder
+                    .header("x-api-key", credential)
+                    .header("anthropic-version", "2023-06-01"),
+                RelayProtocol::OpenAiResponses | RelayProtocol::OpenAiChatCompletions => {
+                    let bearer = HeaderValue::from_str(&format!("Bearer {api_key}"))
+                        .map_err(|_| RelayTransportError::InvalidCredential)?;
+                    builder.header(AUTHORIZATION, bearer)
+                }
+            };
+        } else if protocol == RelayProtocol::AnthropicMessages {
+            builder = builder.header("anthropic-version", "2023-06-01");
+        }
+
+        let started = Instant::now();
+        let response = builder.send().map_err(classify_reqwest_error)?;
+        ensure_not_cancelled(cancelled)?;
+        let status = response.status();
+        if status.is_redirection() {
+            return Err(RelayTransportError::RedirectBlocked {
+                status: status.as_u16(),
+                cross_origin: redirect_crosses_origin(&response, &original_origin),
+            });
+        }
+        if matches!(status.as_u16(), 404 | 405 | 501) {
+            return Ok(RelayModelCatalogProbe {
+                state: RelayModelCatalogState::Unsupported,
+                target_listed: None,
+                model_count: None,
+                http_status: status.as_u16(),
+                latency_ms: duration_ms(started.elapsed()),
+            });
+        }
+        if !status.is_success() {
+            return Err(RelayTransportError::HttpStatus {
+                status: status.as_u16(),
+            });
+        }
+
+        reject_oversized_content_length(response.headers(), self.limits.max_response_bytes)?;
+        let bytes =
+            read_body_limited(response, cancelled, started, self.limits.max_response_bytes)?;
+        let value: Value = serde_json::from_slice(&bytes.body)
+            .map_err(|_| RelayTransportError::MalformedResponse)?;
+        let entries = value
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or(RelayTransportError::MalformedResponse)?;
+        let mut target_listed = false;
+        let mut identifiers = BTreeSet::new();
+        for entry in entries {
+            let identifier = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| is_strict_model_id(value))
+                .ok_or(RelayTransportError::MalformedResponse)?;
+            if !identifiers.insert(identifier) {
+                return Err(RelayTransportError::MalformedResponse);
+            }
+            target_listed |= identifier == target_model;
+        }
+        let openai_has_more = match protocol {
+            RelayProtocol::OpenAiResponses | RelayProtocol::OpenAiChatCompletions => value
+                .get("has_more")
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .ok_or(RelayTransportError::MalformedResponse)
+                })
+                .transpose()?
+                .unwrap_or(false),
+            RelayProtocol::AnthropicMessages => false,
+        };
+        let force_partial_state = status.as_u16() == 206 || openai_has_more;
+        let catalog_complete = match protocol {
+            RelayProtocol::AnthropicMessages => match value.get("has_more") {
+                Some(value) => !value
+                    .as_bool()
+                    .ok_or(RelayTransportError::MalformedResponse)?,
+                // Compatible relays sometimes return an OpenAI-shaped first
+                // page. Without Anthropic's pagination marker, absence of the
+                // requested model is not conclusive.
+                None => false,
+            },
+            RelayProtocol::OpenAiResponses | RelayProtocol::OpenAiChatCompletions => {
+                !force_partial_state
+            }
+        };
+        let state = if force_partial_state {
+            RelayModelCatalogState::PartialCatalog
+        } else if target_listed {
+            RelayModelCatalogState::TargetListed
+        } else if catalog_complete {
+            RelayModelCatalogState::TargetNotListed
+        } else {
+            RelayModelCatalogState::PartialCatalog
+        };
+        Ok(RelayModelCatalogProbe {
+            state,
+            target_listed: (catalog_complete || target_listed).then_some(target_listed),
+            model_count: Some(u32::try_from(entries.len()).unwrap_or(u32::MAX)),
+            http_status: status.as_u16(),
+            latency_ms: duration_ms(started.elapsed()),
+        })
+    }
 }
 
 impl crate::audit_manager::RelayTransportAdapter for RelayTransport {
@@ -543,7 +725,7 @@ fn request_from_operation(
         audit_tool: operation.audit_tool.clone(),
         max_output_tokens: operation.max_output_tokens,
         temperature: Some(operation.temperature),
-        reasoning_effort: None,
+        reasoning_effort: operation.reasoning_effort.clone(),
         stream: operation.streaming,
         timeout_ms: operation.timeout_ms,
     }
@@ -747,6 +929,25 @@ pub fn protocol_endpoint(
     base_url
         .join(relative)
         .map_err(|_| RelayTransportError::InvalidBaseUrl)
+}
+
+fn model_catalog_endpoint(
+    base_url: &Url,
+    protocol: RelayProtocol,
+) -> Result<Url, RelayTransportError> {
+    let base_path = base_url.path().trim_end_matches('/');
+    let relative = if base_path.ends_with("/v1") {
+        "models"
+    } else {
+        "v1/models"
+    };
+    let mut endpoint = base_url
+        .join(relative)
+        .map_err(|_| RelayTransportError::InvalidBaseUrl)?;
+    if protocol == RelayProtocol::AnthropicMessages {
+        endpoint.query_pairs_mut().append_pair("limit", "1000");
+    }
+    Ok(endpoint)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2002,6 +2203,7 @@ fn parse_responses_usage(value: Option<&Value>) -> Option<ReportedUsage> {
     Some(ReportedUsage {
         input_tokens: json_i64(value.get("input_tokens")),
         cached_input_tokens: json_i64(value.pointer("/input_tokens_details/cached_tokens")),
+        cache_creation_input_tokens: None,
         output_tokens: json_i64(value.get("output_tokens")),
         reasoning_output_tokens: json_i64(value.pointer("/output_tokens_details/reasoning_tokens")),
         total_tokens: json_i64(value.get("total_tokens")),
@@ -2013,6 +2215,7 @@ fn parse_chat_usage(value: Option<&Value>) -> Option<ReportedUsage> {
     Some(ReportedUsage {
         input_tokens: json_i64(value.get("prompt_tokens")),
         cached_input_tokens: json_i64(value.pointer("/prompt_tokens_details/cached_tokens")),
+        cache_creation_input_tokens: None,
         output_tokens: json_i64(value.get("completion_tokens")),
         reasoning_output_tokens: json_i64(
             value.pointer("/completion_tokens_details/reasoning_tokens"),
@@ -2026,6 +2229,7 @@ fn parse_anthropic_usage(value: Option<&Value>) -> Option<ReportedUsage> {
     Some(ReportedUsage {
         input_tokens: json_i64(value.get("input_tokens")),
         cached_input_tokens: json_i64(value.get("cache_read_input_tokens")),
+        cache_creation_input_tokens: json_i64(value.get("cache_creation_input_tokens")),
         output_tokens: json_i64(value.get("output_tokens")),
         reasoning_output_tokens: None,
         // Anthropic does not report an OpenAI-style total token field. Do not
@@ -2050,6 +2254,9 @@ fn merge_usage(parsed: &mut ParsedEnvelope, incoming: Option<ReportedUsage>) {
     }
     if incoming.cached_input_tokens.is_some() {
         usage.cached_input_tokens = incoming.cached_input_tokens;
+    }
+    if incoming.cache_creation_input_tokens.is_some() {
+        usage.cache_creation_input_tokens = incoming.cache_creation_input_tokens;
     }
     if incoming.output_tokens.is_some() {
         usage.output_tokens = incoming.output_tokens;
@@ -2234,6 +2441,151 @@ mod tests {
     }
 
     #[test]
+    fn model_catalog_checks_exact_openai_target_without_exposing_the_list() {
+        let body = json!({
+            "object": "list",
+            "data": [
+                {"id": "gpt-test", "object": "model"},
+                {"id": "gpt-other", "object": "model"}
+            ]
+        });
+        let (base_url, captured) = spawn_one_response_server(json_response(&body.to_string()));
+        let probe = RelayTransport::with_default_limits()
+            .expect("transport")
+            .probe_model_catalog(
+                RelayProtocol::OpenAiResponses,
+                &base_url,
+                Some("test-secret"),
+                "gpt-test",
+                2_000,
+                &AtomicBool::new(false),
+            )
+            .expect("OpenAI model directory");
+
+        assert_eq!(probe.state, RelayModelCatalogState::TargetListed);
+        assert_eq!(probe.target_listed, Some(true));
+        assert_eq!(probe.model_count, Some(2));
+        let request = captured.recv().expect("captured catalog request");
+        assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test-secret"));
+        let serialized = serde_json::to_string(&probe).expect("serialize bounded probe");
+        assert!(!serialized.contains("gpt-other"));
+        assert!(!serialized.contains("test-secret"));
+    }
+
+    #[test]
+    fn openai_catalog_marks_explicit_pagination_and_partial_http_as_partial() {
+        for (status_line, has_more, listed_model, expected_target) in [
+            ("200 OK", true, "gpt-other", None),
+            ("206 Partial Content", false, "gpt-test", Some(true)),
+        ] {
+            let body = json!({
+                "object": "list",
+                "data": [{"id": listed_model, "object": "model"}],
+                "has_more": has_more,
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes();
+            let (base_url, _) = spawn_one_response_server(response);
+            let probe = RelayTransport::with_default_limits()
+                .expect("transport")
+                .probe_model_catalog(
+                    RelayProtocol::OpenAiResponses,
+                    &base_url,
+                    None,
+                    "gpt-test",
+                    2_000,
+                    &AtomicBool::new(false),
+                )
+                .expect("bounded partial OpenAI model directory");
+
+            assert_eq!(probe.state, RelayModelCatalogState::PartialCatalog);
+            assert_eq!(probe.target_listed, expected_target);
+            assert_eq!(probe.model_count, Some(1));
+        }
+    }
+
+    #[test]
+    fn anthropic_catalog_uses_documented_headers_and_marks_incomplete_pages() {
+        let body = json!({
+            "data": [{"id": "claude-other", "type": "model"}],
+            "has_more": true,
+            "first_id": "claude-other",
+            "last_id": "claude-other"
+        });
+        let (base_url, captured) = spawn_one_response_server(json_response(&body.to_string()));
+        let probe = RelayTransport::with_default_limits()
+            .expect("transport")
+            .probe_model_catalog(
+                RelayProtocol::AnthropicMessages,
+                &base_url,
+                Some("anthropic-secret"),
+                "claude-test",
+                2_000,
+                &AtomicBool::new(false),
+            )
+            .expect("Anthropic model directory");
+
+        assert_eq!(probe.state, RelayModelCatalogState::PartialCatalog);
+        assert_eq!(probe.target_listed, None);
+        let request = captured.recv().expect("captured Anthropic catalog request");
+        assert!(request.starts_with("GET /v1/models?limit=1000 HTTP/1.1"));
+        let headers = request.to_ascii_lowercase();
+        assert!(headers.contains("x-api-key: anthropic-secret"));
+        assert!(headers.contains("anthropic-version: 2023-06-01"));
+    }
+
+    #[test]
+    fn absent_model_directory_is_explicitly_unsupported_not_successful() {
+        let response =
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (base_url, _) = spawn_one_response_server(response);
+        let probe = RelayTransport::with_default_limits()
+            .expect("transport")
+            .probe_model_catalog(
+                RelayProtocol::OpenAiChatCompletions,
+                &base_url,
+                None,
+                "gpt-test",
+                2_000,
+                &AtomicBool::new(false),
+            )
+            .expect("unsupported directory remains inspectable");
+
+        assert_eq!(probe.state, RelayModelCatalogState::Unsupported);
+        assert_eq!(probe.target_listed, None);
+        assert_eq!(probe.http_status, 404);
+    }
+
+    #[test]
+    fn malformed_or_duplicate_model_directory_entries_are_rejected() {
+        for body in [
+            json!({"data": [{"display_name": "missing id"}]}),
+            json!({"data": [{"id": "gpt-test"}, {"id": "gpt-test"}]}),
+        ] {
+            let (base_url, _) = spawn_one_response_server(json_response(&body.to_string()));
+            let error = RelayTransport::with_default_limits()
+                .expect("transport")
+                .probe_model_catalog(
+                    RelayProtocol::OpenAiResponses,
+                    &base_url,
+                    None,
+                    "gpt-test",
+                    2_000,
+                    &AtomicBool::new(false),
+                )
+                .expect_err("invalid model directory must not be accepted");
+            assert_eq!(error, RelayTransportError::MalformedResponse);
+        }
+    }
+
+    #[test]
     fn builds_protocol_correct_state_history_and_forced_client_tool_bodies() {
         let responses = build_request_body(&state_and_tool_request(RelayProtocol::OpenAiResponses));
         assert_eq!(responses["instructions"], "Keep the supplied state.");
@@ -2275,6 +2627,31 @@ mod tests {
         assert_eq!(anthropic["tool_choice"]["type"], "tool");
         assert_eq!(anthropic["tool_choice"]["name"], "xiaoli_record_probe");
         assert_eq!(anthropic["tool_choice"]["disable_parallel_tool_use"], true);
+    }
+
+    #[test]
+    fn effort_is_exactly_forwarded_for_openai_and_rejected_for_anthropic() {
+        let mut responses = request(
+            "https://example.invalid/v1".to_owned(),
+            RelayProtocol::OpenAiResponses,
+        );
+        responses.reasoning_effort = Some("high".to_owned());
+        assert_eq!(
+            build_request_body(&responses)["reasoning"]["effort"],
+            "high"
+        );
+
+        let mut chat = responses.clone();
+        chat.protocol = RelayProtocol::OpenAiChatCompletions;
+        assert_eq!(build_request_body(&chat)["reasoning_effort"], "high");
+
+        let mut anthropic = responses;
+        anthropic.protocol = RelayProtocol::AnthropicMessages;
+        assert!(matches!(
+            anthropic.validate(),
+            Err(RelayTransportError::InvalidRequest(message))
+                if message.contains("does not support")
+        ));
     }
 
     #[test]
@@ -3556,6 +3933,7 @@ mod tests {
             "usage": {
                 "input_tokens": 11,
                 "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 5,
                 "output_tokens": 2
             }
         });
@@ -3567,6 +3945,7 @@ mod tests {
         let usage = parsed.usage.expect("anthropic usage");
         assert_eq!(usage.input_tokens, Some(11));
         assert_eq!(usage.cached_input_tokens, Some(7));
+        assert_eq!(usage.cache_creation_input_tokens, Some(5));
         assert_eq!(usage.output_tokens, Some(2));
         assert_eq!(usage.total_tokens, None);
     }

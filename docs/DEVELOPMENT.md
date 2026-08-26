@@ -58,10 +58,11 @@ pnpm run tauri:dev
 - 基线不足、单信号、双信号连续命中、健康清除和 5.5 对照门槛。
 - 刷新单飞、尾随合并和发布阶段锁已释放。
 - 来源识别覆盖官方 OAuth/API、托管 provider、自定义/本地端点与冲突证据。
+- Hook 覆盖慢标准输入、超过 256 KiB 的输入、本地 IPC 超时和慢原子 fallback；所有阶段共享处理入口起算的 150ms 单调时钟上限，并记录快速路径 P95。
 - 本地 mock relay 覆盖三协议、SSE 半包/断流、429、超时、取消、重定向、超大响应和错误 usage。
-- 审计覆盖 CSPRNG 顺序、档位硬预算、JSD、标准/深度档的 MMD permutation、无实时官方配对时身份轴证据不足，以及取消后不开新请求。
+- 审计覆盖 CSPRNG 顺序、档位硬预算、JSD、标准/深度档的 MMD permutation、无实时官方配对且未选择适用签名静态包时身份轴证据不足，以及取消后不开新请求。
 
-当前中转质量 fixture 覆盖结构化 JSON、长上下文 nonce 检索、算术/约束推理、多语言、工具选择和状态保持六个域。工具 fixture 必须验证三种协议的真实 tool schema 与受限函数名/字符串参数 scorer，同时断言调用、URL、代码从不执行且原始响应正文不持久化；状态 fixture 只验证单次请求所携带的 `system / user / assistant / user` 多消息历史，不得声称跨网络会话状态机或物理模型证明。`RelayBaselineSummary` 的导入/列出/删除测试只验证元数据隔离，不得把它当成 scorer 输入。`community_baseline.rs` 的编译时参考只能产生低置信相对排名：测试必须断言它不改变 `overallVerdict`、不改变四轴状态，且永远不写入 `actualModel`。
+当前中转质量 fixture 覆盖结构化 JSON、长上下文 nonce 检索、算术/约束推理、多语言、工具选择和状态保持六个域。工具 fixture 必须验证三种协议的真实 tool schema 与受限函数名/字符串参数 scorer，同时断言调用、URL、代码从不执行且原始响应正文不持久化；状态 fixture 只验证单次请求所携带的 `system / user / assistant / user` 多消息历史，不得声称跨网络会话状态机或物理模型证明。签名基线测试必须覆盖：包内公钥不能自我授权、签名覆盖所有 scorer 参数与 cell 分布、未知/无效签名只落元数据、每次加载重验签与过期检查、撤销 trust anchor 立即移除 scorer 包、低置信一致结果不能单独把 `overallVerdict` 设为 `consistent`。`community_baseline.rs` 的编译时参考只能产生低置信相对排名：测试必须断言它不改变 `overallVerdict`、不改变四轴状态，且永远不写入 `actualModel`。
 
 ## 前端 mock
 

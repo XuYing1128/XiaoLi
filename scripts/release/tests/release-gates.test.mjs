@@ -35,6 +35,8 @@ const cargoPackages = new Map([
   ["keyring", "4.1.0"],
   ["serde", "1.0.228"],
   ["serde_json", "1.0.149"],
+  ["base64", "0.22.1"],
+  ["ed25519-dalek", "2.2.0"],
 ]);
 const pnpmPackages = new Map([
   ["@tauri-apps/api", "2.11.1"],

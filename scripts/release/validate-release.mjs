@@ -18,6 +18,8 @@ const CRITICAL_CARGO_PACKAGES = [
   "keyring",
   "serde",
   "serde_json",
+  "base64",
+  "ed25519-dalek",
 ];
 const CRITICAL_PNPM_PACKAGES = [
   "@tauri-apps/api",

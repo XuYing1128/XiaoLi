@@ -26,17 +26,19 @@ use std::{
     io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::mpsc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const PLUGIN_NAME: &str = "xiaoli-model-monitor";
 const PLUGIN_VERSION: &str = "0.2.0-beta.1";
-const MAX_HOOK_BYTES: u64 = 16 * 1024 * 1024;
+// Hook payloads are metadata envelopes, not a transport for prompt or response
+// bodies. Keep the cap 64x below the previous 16 MiB limit so a hostile or
+// accidental body cannot consume the entire fail-open budget.
+const MAX_HOOK_BYTES: usize = 256 * 1024;
 const MAX_MCP_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
-// Reserve most of the 150 ms fail-open budget for cold process startup and
-// the atomic fallback write. A healthy local pipe normally answers in a few
-// milliseconds; a busy collector must never hold up prompt submission.
-const HOOK_DELIVERY_DEADLINE_MS: u64 = 40;
+// One monotonic deadline covers stdin, parsing, local IPC and the optional
+// atomic fallback. The Codex host timeout remains a secondary safety net.
+const HOOK_FAIL_OPEN_BUDGET: Duration = Duration::from_millis(150);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -81,39 +83,146 @@ fn print_utility_result(result: Result<Value, String>) {
 }
 
 fn hook_capture(fallback_dir: Option<&Path>) {
-    let result = (|| -> Result<(), String> {
-        let mut bytes = Vec::new();
-        std::io::stdin()
-            .take(MAX_HOOK_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| error.to_string())?;
-        if bytes.len() as u64 > MAX_HOOK_BYTES {
-            return Err("hook_input_too_large".to_owned());
-        }
-        let input: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid_json".to_owned())?;
-        let Some(event) = sanitize_hook_input(&input) else {
-            return Ok(());
-        };
-        if send_hook_request_with_deadline(event.clone()).is_err() {
-            persist_hook_fallback(&event, fallback_dir)?;
-        }
-        Ok(())
-    })();
-    let _ = result;
+    let fallback_dir = fallback_dir.map(Path::to_path_buf);
+    let _ = run_hook_with_budget(HOOK_FAIL_OPEN_BUDGET, move |deadline| {
+        process_hook_input(std::io::stdin(), fallback_dir, deadline)
+    });
     println!("{}", json!({"continue": true, "suppressOutput": true}));
 }
 
-fn send_hook_request_with_deadline(event: Value) -> Result<Value, String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HookWorkerOutcome {
+    Completed,
+    DeadlineReached,
+    SpawnFailed,
+}
+
+fn run_hook_with_budget<F>(budget: Duration, work: F) -> HookWorkerOutcome
+where
+    F: FnOnce(Instant) -> Result<(), String> + Send + 'static,
+{
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .unwrap_or_else(Instant::now);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("xiaoli-hook-capture".to_owned())
+        .spawn(move || {
+            let _ = sender.send(work(deadline));
+        })
+        .is_err()
+    {
+        return HookWorkerOutcome::SpawnFailed;
+    }
+    let Some(remaining) = remaining_hook_budget(deadline) else {
+        return HookWorkerOutcome::DeadlineReached;
+    };
+    match receiver.recv_timeout(remaining) {
+        Ok(_) => HookWorkerOutcome::Completed,
+        Err(_) => HookWorkerOutcome::DeadlineReached,
+    }
+}
+
+fn process_hook_input<R>(
+    mut reader: R,
+    fallback_dir: Option<PathBuf>,
+    deadline: Instant,
+) -> Result<(), String>
+where
+    R: Read,
+{
+    let bytes = read_hook_input(&mut reader, deadline)?;
+    ensure_hook_budget(deadline)?;
+    let input: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid_json".to_owned())?;
+    ensure_hook_budget(deadline)?;
+    let Some(event) = sanitize_hook_input(&input) else {
+        return Ok(());
+    };
+    ensure_hook_budget(deadline)?;
+    if send_hook_request_with_deadline(event.clone(), deadline).is_err() {
+        persist_hook_fallback_with_deadline(event, fallback_dir, deadline)?;
+    }
+    Ok(())
+}
+
+fn read_hook_input<R: Read>(reader: &mut R, deadline: Instant) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        ensure_hook_budget(deadline)?;
+        let remaining_capacity = MAX_HOOK_BYTES.saturating_add(1).saturating_sub(bytes.len());
+        if remaining_capacity == 0 {
+            return Err("hook_input_too_large".to_owned());
+        }
+        let read_capacity = chunk.len().min(remaining_capacity);
+        let read = reader
+            .read(&mut chunk[..read_capacity])
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() > MAX_HOOK_BYTES {
+            return Err("hook_input_too_large".to_owned());
+        }
+    }
+    Ok(bytes)
+}
+
+fn ensure_hook_budget(deadline: Instant) -> Result<(), String> {
+    remaining_hook_budget(deadline)
+        .map(|_| ())
+        .ok_or_else(|| "hook_deadline_reached".to_owned())
+}
+
+fn remaining_hook_budget(deadline: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+fn run_hook_task_with_deadline<T, F>(
+    deadline: Instant,
+    thread_name: &'static str,
+    timeout_error: &'static str,
+    task: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    ensure_hook_budget(deadline)?;
     let (sender, receiver) = mpsc::sync_channel(1);
     std::thread::Builder::new()
-        .name("xiaoli-hook-send".to_owned())
+        .name(thread_name.to_owned())
         .spawn(move || {
-            let _ = sender.send(ipc::send_request(&event));
+            let _ = sender.send(task());
         })
         .map_err(|error| error.to_string())?;
+    let remaining =
+        remaining_hook_budget(deadline).ok_or_else(|| "hook_deadline_reached".to_owned())?;
     receiver
-        .recv_timeout(Duration::from_millis(HOOK_DELIVERY_DEADLINE_MS))
-        .map_err(|_| "hook_delivery_timeout".to_owned())?
+        .recv_timeout(remaining)
+        .map_err(|_| timeout_error.to_owned())?
+}
+
+fn send_hook_request_with_deadline(event: Value, deadline: Instant) -> Result<Value, String> {
+    send_hook_request_with_deadline_using(event, deadline, |event| ipc::send_request(&event))
+}
+
+fn send_hook_request_with_deadline_using<F>(
+    event: Value,
+    deadline: Instant,
+    send: F,
+) -> Result<Value, String>
+where
+    F: FnOnce(Value) -> Result<Value, String> + Send + 'static,
+{
+    run_hook_task_with_deadline(
+        deadline,
+        "xiaoli-hook-send",
+        "hook_delivery_timeout",
+        move || send(event),
+    )
 }
 
 fn sanitize_hook_input(input: &Value) -> Option<Value> {
@@ -207,6 +316,33 @@ fn persist_hook_fallback(event: &Value, fallback_dir: Option<&Path>) -> Result<(
         }
     }
     Err("hook_fallback_unavailable".to_owned())
+}
+
+fn persist_hook_fallback_with_deadline(
+    event: Value,
+    fallback_dir: Option<PathBuf>,
+    deadline: Instant,
+) -> Result<(), String> {
+    persist_hook_fallback_with_deadline_using(event, fallback_dir, deadline, |event, directory| {
+        persist_hook_fallback(&event, directory.as_deref())
+    })
+}
+
+fn persist_hook_fallback_with_deadline_using<F>(
+    event: Value,
+    fallback_dir: Option<PathBuf>,
+    deadline: Instant,
+    persist: F,
+) -> Result<(), String>
+where
+    F: FnOnce(Value, Option<PathBuf>) -> Result<(), String> + Send + 'static,
+{
+    run_hook_task_with_deadline(
+        deadline,
+        "xiaoli-hook-fallback",
+        "hook_fallback_timeout",
+        move || persist(event, fallback_dir),
+    )
 }
 
 fn run_mcp_server() {
@@ -1075,6 +1211,31 @@ const PLUGIN_ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::Cursor,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        thread,
+    };
+
+    struct SlowReader {
+        payload: Option<Vec<u8>>,
+        delay: Duration,
+    }
+
+    impl Read for SlowReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let Some(payload) = self.payload.take() else {
+                return Ok(0);
+            };
+            thread::sleep(self.delay);
+            let length = payload.len().min(buffer.len());
+            buffer[..length].copy_from_slice(&payload[..length]);
+            Ok(length)
+        }
+    }
 
     #[test]
     fn hook_sanitizer_keeps_only_metadata() {
@@ -1093,6 +1254,102 @@ mod tests {
         assert_eq!(value.as_object().map(|value| value.len()), Some(7));
         assert!(value.get("endpointClass").is_some());
         assert!(value.get("endpointHostHash").is_some());
+    }
+
+    #[test]
+    fn hook_fail_open_deadline_bounds_a_stalled_stdin_read() {
+        let started = Instant::now();
+        let outcome = run_hook_with_budget(Duration::from_millis(30), |deadline| {
+            process_hook_input(
+                SlowReader {
+                    payload: Some(br#"{}"#.to_vec()),
+                    delay: Duration::from_millis(250),
+                },
+                None,
+                deadline,
+            )
+        });
+        assert_eq!(outcome, HookWorkerOutcome::DeadlineReached);
+        assert!(
+            started.elapsed() < Duration::from_millis(120),
+            "fail-open supervisor waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn hook_rejects_oversized_metadata_before_parsing_or_delivery() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let error = read_hook_input(&mut Cursor::new(vec![b'x'; MAX_HOOK_BYTES + 1]), deadline)
+            .expect_err("oversized hook input must fail open");
+        assert_eq!(error, "hook_input_too_large");
+    }
+
+    #[test]
+    fn hook_ipc_and_fallback_share_the_same_remaining_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let delivery =
+            send_hook_request_with_deadline_using(json!({"event":"Stop"}), deadline, |_| {
+                thread::sleep(Duration::from_millis(200));
+                Ok(json!({"ok": true}))
+            });
+        assert_eq!(delivery.unwrap_err(), "hook_delivery_timeout");
+
+        let fallback_started = Arc::new(AtomicBool::new(false));
+        let observed = fallback_started.clone();
+        let fallback = persist_hook_fallback_with_deadline_using(
+            json!({"event":"Stop"}),
+            None,
+            deadline,
+            move |_, _| {
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert_eq!(fallback.unwrap_err(), "hook_deadline_reached");
+        assert!(!fallback_started.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn hook_deadline_bounds_a_slow_atomic_fallback() {
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let started = Instant::now();
+        let result = persist_hook_fallback_with_deadline_using(
+            json!({"event":"Stop"}),
+            None,
+            deadline,
+            |_, _| {
+                thread::sleep(Duration::from_millis(200));
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err(), "hook_fallback_timeout");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "fallback deadline waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn hook_fast_path_p95_stays_inside_the_fail_open_target() {
+        let mut samples = Vec::new();
+        for _ in 0..40 {
+            let started = Instant::now();
+            let outcome = run_hook_with_budget(HOOK_FAIL_OPEN_BUDGET, |deadline| {
+                process_hook_input(Cursor::new(br#"{}"#.to_vec()), None, deadline)
+            });
+            assert_eq!(outcome, HookWorkerOutcome::Completed);
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let p95 = samples[(samples.len() * 95).div_ceil(100) - 1];
+        assert!(
+            p95 < HOOK_FAIL_OPEN_BUDGET,
+            "hook fast-path P95 {:?} exceeded {:?}",
+            p95,
+            HOOK_FAIL_OPEN_BUDGET
+        );
     }
 
     #[test]
