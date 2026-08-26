@@ -11,12 +11,19 @@ use std::{
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
 
 pub type MessageHandler = Arc<dyn Fn(&str) -> Result<Value, String> + Send + Sync + 'static>;
+
+const MAX_IPC_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_CONCURRENT_IPC_CONNECTIONS: usize = 8;
+const IPC_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Keeps the per-login-session instance mutex alive for the lifetime of the
 /// primary process. Windows releases the named mutex automatically if the
@@ -204,36 +211,66 @@ pub fn start_hook_listener(state_root: &Path, handler: MessageHandler) -> Result
     thread::Builder::new()
         .name("xiaoli-hook-ipc".to_string())
         .spawn(move || {
+            let active_connections = Arc::new(AtomicUsize::new(0));
             for connection in listener.incoming() {
-                let Ok(mut connection) = connection else {
+                let Ok(connection) = connection else {
                     continue;
                 };
-                // Named pipes do not support OS read timeouts in interprocess.
-                // Nonblocking polling gives every client a hard deadline, so a
-                // same-user peer that never sends a newline cannot freeze hook,
-                // MCP and control traffic behind one serial read.
-                let result =
-                    read_bounded_line(&mut connection, 16 * 1024, Duration::from_millis(500))
-                        .map_err(|error| error.to_string())
-                        .and_then(|payload| handler(payload.trim_end()));
-                let response = match result {
-                    Ok(value) => serde_json::to_vec(&value).unwrap_or_else(|_| {
-                        b"{\"ok\":false,\"error\":\"serialization_failed\"}".to_vec()
-                    }),
-                    Err(error) => serde_json::to_vec(&serde_json::json!({
-                        "ok": false,
-                        "error": error.chars().take(160).collect::<String>()
-                    }))
-                    .unwrap_or_else(|_| b"{\"ok\":false}".to_vec()),
-                };
-                let _ = connection.write_all(&response);
-                let _ = connection.write_all(b"\n");
-                let _ = connection.flush();
+                let admitted = active_connections
+                    .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |count| {
+                        (count < MAX_CONCURRENT_IPC_CONNECTIONS).then_some(count + 1)
+                    })
+                    .is_ok();
+                if !admitted {
+                    continue;
+                }
+                let connection_count = Arc::clone(&active_connections);
+                let connection_handler = Arc::clone(&handler);
+                let spawn_result = thread::Builder::new()
+                    .name("xiaoli-hook-ipc-client".to_owned())
+                    .spawn(move || {
+                        let _permit = ActiveIpcConnection(connection_count);
+                        serve_ipc_connection(connection, &connection_handler);
+                    });
+                if spawn_result.is_err() {
+                    active_connections.fetch_sub(1, AtomicOrdering::AcqRel);
+                }
             }
         })
         .map_err(|error| error.to_string())?;
 
     Ok(endpoint.display_name())
+}
+
+struct ActiveIpcConnection(Arc<AtomicUsize>);
+
+impl Drop for ActiveIpcConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::AcqRel);
+    }
+}
+
+fn serve_ipc_connection(mut connection: Stream, handler: &MessageHandler) {
+    // Named pipes do not support portable OS read/write timeouts through
+    // interprocess. Nonblocking polling bounds both directions, while one
+    // stalled same-user client occupies only its own bounded worker.
+    let result = read_bounded_line(&mut connection, 16 * 1024, Duration::from_millis(500))
+        .map_err(|error| error.to_string())
+        .and_then(|payload| handler(payload.trim_end()));
+    let mut response = match result {
+        Ok(value) => serde_json::to_vec(&value)
+            .unwrap_or_else(|_| b"{\"ok\":false,\"error\":\"serialization_failed\"}".to_vec()),
+        Err(error) => serde_json::to_vec(&serde_json::json!({
+            "ok": false,
+            "error": error.chars().take(160).collect::<String>()
+        }))
+        .unwrap_or_else(|_| b"{\"ok\":false}".to_vec()),
+    };
+    if response.len() > MAX_IPC_RESPONSE_BYTES {
+        response = b"{\"ok\":false,\"error\":\"response_too_large\"}".to_vec();
+    }
+    response.push(b'\n');
+    let _ = write_bounded_response(&mut connection, &response, IPC_RESPONSE_WRITE_TIMEOUT);
 }
 
 pub fn send_request(payload: &Value) -> Result<Value, String> {
@@ -272,6 +309,52 @@ fn read_bounded_line(
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
     }
+}
+
+fn write_bounded_response(stream: &mut Stream, bytes: &[u8], timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    set_nonblocking_for_bounded_read(stream, deadline)?;
+    let result = write_all_nonblocking(stream, bytes, deadline);
+    let restore_result = stream.set_nonblocking(false);
+    match (result, restore_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+fn write_all_nonblocking(stream: &mut Stream, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "IPC response write timed out",
+            ));
+        }
+        match stream.write(&bytes[written..]) {
+            Ok(0) => thread::sleep(Duration::from_millis(2)),
+            Ok(count) => written = written.saturating_add(count),
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || is_windows_pipe_write_pending(&error) =>
+            {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_windows_pipe_write_pending(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(231 | 232 | 536))
+}
+
+#[cfg(not(windows))]
+fn is_windows_pipe_write_pending(_error: &io::Error) -> bool {
+    false
 }
 
 fn set_nonblocking_for_bounded_read(stream: &Stream, deadline: Instant) -> io::Result<()> {
@@ -1004,6 +1087,59 @@ mod tests {
             .expect_err("invalid UTF-8 must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "IPC line is not UTF-8");
+    }
+
+    #[test]
+    fn nonreading_response_client_times_out_and_next_connection_is_served() {
+        let endpoint = unique_test_endpoint("response-write-timeout");
+        let listener = endpoint.create_listener().expect("test IPC listener");
+        let (first_done_tx, first_done_rx) = mpsc::sync_channel(0);
+        let server = thread::spawn(move || -> io::Result<String> {
+            let mut first = listener.incoming().next().expect("first incoming stream")?;
+            let request = read_bounded_line(&mut first, 1024, Duration::from_millis(500))?;
+            assert_eq!(request, "first\n");
+            let oversized = vec![b'x'; 32 * 1024 * 1024];
+            let error = write_bounded_response(&mut first, &oversized, Duration::from_millis(100))
+                .expect_err("a client that never reads must hit the response deadline");
+            first_done_tx
+                .send(error.kind())
+                .expect("signal bounded response completion");
+            drop(first);
+
+            let mut second = listener
+                .incoming()
+                .next()
+                .expect("second incoming stream")?;
+            let request = read_bounded_line(&mut second, 1024, Duration::from_millis(500))?;
+            write_bounded_response(&mut second, b"{\"ok\":true}\n", Duration::from_millis(500))?;
+            Ok(request)
+        });
+
+        let mut first = endpoint.connect().expect("first test client");
+        first.write_all(b"first\n").expect("write first request");
+        first.flush().expect("flush first request");
+        assert_eq!(
+            first_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("response write should be bounded"),
+            io::ErrorKind::TimedOut
+        );
+
+        let mut second = endpoint.connect().expect("second test client");
+        second.write_all(b"second\n").expect("write second request");
+        second.flush().expect("flush second request");
+        let response = read_bounded_line(&mut second, 1024, Duration::from_secs(2))
+            .expect("second client response");
+        assert_eq!(response, "{\"ok\":true}\n");
+        assert_eq!(
+            server
+                .join()
+                .expect("server thread")
+                .expect("server should recover"),
+            "second\n"
+        );
+        drop(first);
+        cleanup_test_endpoint(&endpoint);
     }
 
     #[cfg(not(windows))]

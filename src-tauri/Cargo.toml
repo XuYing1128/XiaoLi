@@ -1,6 +1,6 @@
 [package]
 name = "xiaoli"
-version = "0.1.0-beta.3"
+version = "0.2.0-beta.1"
 description = "XiaoLi: evidence-aware Codex model and token monitor"
 authors = ["XuYing1128"]
 edition = "2021"
@@ -48,6 +48,11 @@ sysinfo = "0.37"
 atomicwrites = "0.4"
 widestring = "1"
 fs2 = "0.4"
+getrandom = "0.3"
+keyring = "4.1"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+tiktoken-rs = "0.12"
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

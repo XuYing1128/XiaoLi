@@ -1,3 +1,4 @@
+use crate::connection::ConnectionOriginSnapshot;
 use crate::metrics::{
     cache_input_share, observed_output_rate, output_bucket, reasoning_active_ms, timing_snapshot,
     uncached_input_bucket, union_interval_ms, usage_since_baseline, usage_snapshot,
@@ -62,17 +63,52 @@ impl RolloutCollector {
         let Some(turn_id) = clean_optional(observation.turn_id.clone()) else {
             return;
         };
-        let Some(model) = clean_optional(observation.model.clone()) else {
+        let model = clean_optional(observation.model.clone());
+        if model.is_none() && observation.endpoint_class.is_none() {
             return;
-        };
+        }
         let key = (observation.thread_id.clone(), turn_id.clone());
         let observation = HookObservation {
             turn_id: Some(turn_id),
-            model: Some(model),
+            model,
             ..observation
         };
         self.hook_observations.insert(key.clone(), observation);
         self.trim_observations(&key);
+    }
+
+    /// Returns turn-bound endpoint classes observed by the fail-open hook.
+    /// Endpoint-scope digests deliberately remain private to the collector and
+    /// are never copied into public snapshots or persisted history.
+    pub fn active_hook_endpoint_classes(
+        &self,
+    ) -> HashMap<(String, String), crate::connection::EndpointClass> {
+        self.hook_observations
+            .iter()
+            .filter_map(|(key, observation)| {
+                observation.endpoint_class.map(|class| (key.clone(), class))
+            })
+            .collect()
+    }
+
+    /// Returns turn-bound, one-way endpoint-scope digests covering scheme,
+    /// host, effective port, and normalized base path. They are used only for
+    /// matching real Codex turns to an explicitly configured relay profile.
+    /// Callers must not serialize or persist them; history stores only the
+    /// matched local profile id.
+    pub(crate) fn active_hook_endpoint_host_hashes(&self) -> HashMap<(String, String), String> {
+        self.hook_observations
+            .iter()
+            .filter_map(|(key, observation)| {
+                observation
+                    .endpoint_host_hash
+                    .as_ref()
+                    .filter(|value| {
+                        value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    .map(|value| (key.clone(), value.to_ascii_lowercase()))
+            })
+            .collect()
     }
 
     /// Accepts only a structured, explicitly thread/turn-bound reroute event.
@@ -622,6 +658,7 @@ impl RolloutCollector {
             usage,
             timing,
             quality_assessment: QualityAssessment::default(),
+            connection_origin: ConnectionOriginSnapshot::unknown(),
             tool_activity: turn.tool_activity,
             status,
             // Heuristic anomaly detection is intentionally a separate future
@@ -1170,6 +1207,16 @@ fn process_session_meta(state: &mut FileState, record: &Value, ordinal: i64) {
     // Preserve identity and segment position even when pagination is invalid.
     // A malformed newer segment must suppress stale state from an older file.
     state.thread_id = Some(thread_id.clone());
+    state.model_provider = get_string(
+        payload,
+        &[
+            "model_provider",
+            "modelProvider",
+            "provider",
+            "provider_id",
+            "providerId",
+        ],
+    );
     state.segment_start_ordinal = ordinal;
     if ordinal > 0 {
         let history_mode = get_string(payload, &["history_mode", "historyMode"]);
@@ -2517,6 +2564,8 @@ mod tests {
             thread_id: "thread-hook".to_owned(),
             turn_id: Some("turn-hook".to_owned()),
             model: Some("gpt-5.6-terra".to_owned()),
+            endpoint_class: None,
+            endpoint_host_hash: None,
             observed_at: "2026-08-24T08:00:04.000Z".to_owned(),
         });
         let snapshot = collector.scan_at(true, 1_787_558_470_000);
@@ -2853,6 +2902,8 @@ mod tests {
             thread_id: active_key.0.clone(),
             turn_id: Some(active_key.1.clone()),
             model: Some("gpt-5.6-sol".to_owned()),
+            endpoint_class: None,
+            endpoint_host_hash: None,
             observed_at: "2026-08-24T08:00:06.000Z".to_owned(),
         });
         collector.observe_server_reroute(ModelReroutedObservation {
@@ -2870,6 +2921,8 @@ mod tests {
                 thread_id: format!("inactive-hook-{index}"),
                 turn_id: Some(format!("turn-{index}")),
                 model: Some("gpt-5.6-sol".to_owned()),
+                endpoint_class: None,
+                endpoint_host_hash: None,
                 observed_at: observed_at.clone(),
             });
             collector.observe_server_reroute(ModelReroutedObservation {
@@ -3143,6 +3196,95 @@ mod tests {
     }
 
     #[test]
+    fn cache_v10_round_trip_and_cold_rebuild_recover_session_model_provider() {
+        let fixture = TestDirectory::new("cache-provider-v10");
+        let path = fixture.rollout("cache-provider-v10");
+        append(
+            &path,
+            &line(serde_json::json!({
+                "timestamp": "2026-08-24T08:00:00.000Z",
+                "ordinal": 0,
+                "type": "session_meta",
+                "payload": {
+                    "id": "thread-provider-v10",
+                    "cwd": "C:\\private-must-not-enter-cache",
+                    "thread_source": "user",
+                    "model_provider": "relay"
+                }
+            })),
+        );
+        append(
+            &path,
+            &line(event(
+                1,
+                "thread_settings_applied",
+                serde_json::json!({"thread_settings":{
+                    "model":"gpt-5.6-sol",
+                    "reasoning_effort":"ultra"
+                }}),
+            )),
+        );
+        append(
+            &path,
+            &line(event(
+                2,
+                "task_started",
+                serde_json::json!({"turn_id":"turn-provider-v10"}),
+            )),
+        );
+        append(
+            &path,
+            &line(context(3, "turn-provider-v10", "gpt-5.6-sol", "ultra")),
+        );
+
+        let mut first = RolloutCollector::new(&fixture.0, None);
+        first.scan_at(true, 1_787_558_550_000);
+        assert_eq!(
+            first
+                .file_states()
+                .next()
+                .and_then(|state| state.model_provider.as_deref()),
+            Some("relay")
+        );
+        let cache = first.export_cache();
+        assert_eq!(cache.cache_format_version, 10);
+        assert_eq!(cache.files.len(), 1);
+        assert_eq!(cache.files[0].model_provider.as_deref(), Some("relay"));
+        let cache_json = serde_json::to_string(&cache).expect("serialize cache fixture");
+        assert!(!cache_json.contains("private-must-not-enter-cache"));
+
+        let mut resumed = RolloutCollector::new(&fixture.0, None);
+        assert!(resumed
+            .restore_cache(serde_json::from_str(&cache_json).expect("deserialize v10 cache")));
+        resumed.scan_at(true, 1_787_558_551_000);
+        assert_eq!(
+            resumed
+                .file_states()
+                .next()
+                .and_then(|state| state.model_provider.as_deref()),
+            Some("relay")
+        );
+
+        // A v9 cursor may be parked at EOF without provider evidence. Version
+        // 10 must reject it, replay the rollout header and recover the provider
+        // from session_meta rather than retaining an unknown origin forever.
+        let mut stale: CollectorCache =
+            serde_json::from_str(&cache_json).expect("deserialize stale cache fixture");
+        stale.cache_format_version = 9;
+        stale.files[0].model_provider = None;
+        let mut rebuilt = RolloutCollector::new(&fixture.0, None);
+        assert!(!rebuilt.restore_cache(stale));
+        rebuilt.scan_at(true, 1_787_558_552_000);
+        assert_eq!(
+            rebuilt
+                .file_states()
+                .next()
+                .and_then(|state| state.model_provider.as_deref()),
+            Some("relay")
+        );
+    }
+
+    #[test]
     fn persisted_relative_paths_are_normalized_and_cannot_escape_sessions_root() {
         let fixture = TestDirectory::new("relative-cache-path");
         let rollout = fixture.rollout("relative-cache-path");
@@ -3338,6 +3480,8 @@ mod tests {
             thread_id: "thread-session-start".to_owned(),
             turn_id: None,
             model: None,
+            endpoint_class: None,
+            endpoint_host_hash: None,
             observed_at: "2026-08-24T08:00:00.000Z".to_owned(),
         });
         let snapshot = collector.scan_at(true, 1_787_558_480_000);
@@ -3349,6 +3493,34 @@ mod tests {
             snapshot.conversations[0].status.code,
             "request_evidence_conflict"
         );
+    }
+
+    #[test]
+    fn hook_endpoint_class_is_turn_bound_but_host_hash_is_not_exported() {
+        let mut collector = RolloutCollector::new("unused", None);
+        collector.observe_hook(HookObservation {
+            thread_id: "thread-origin".to_owned(),
+            turn_id: Some("turn-origin".to_owned()),
+            model: None,
+            endpoint_class: Some(crate::connection::EndpointClass::CustomEndpoint),
+            endpoint_host_hash: Some("0123456789abcdef".to_owned()),
+            observed_at: "2026-08-24T08:00:00.000Z".to_owned(),
+        });
+        assert_eq!(
+            collector
+                .active_hook_endpoint_classes()
+                .get(&("thread-origin".to_owned(), "turn-origin".to_owned())),
+            Some(&crate::connection::EndpointClass::CustomEndpoint)
+        );
+        assert_eq!(
+            collector
+                .active_hook_endpoint_host_hashes()
+                .get(&("thread-origin".to_owned(), "turn-origin".to_owned())),
+            Some(&"0123456789abcdef".to_owned())
+        );
+        let cache = serde_json::to_string(&collector.export_cache()).unwrap();
+        assert!(!cache.contains("0123456789abcdef"));
+        assert!(!cache.contains("customEndpoint"));
     }
 
     #[test]

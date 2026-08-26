@@ -1,10 +1,20 @@
 pub mod app;
+pub mod audit_manager;
 pub mod collector;
+pub mod community_baseline;
+pub mod connection;
+pub mod credentials;
+pub mod history;
 pub mod ipc;
 pub mod metrics;
 pub mod model;
 pub mod persistence;
+pub mod private_probe_pack;
+pub mod relay_audit;
+pub mod relay_baseline;
+pub mod relay_transport;
 pub mod runtime;
+pub mod selective_service;
 
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use chrono::Utc;
@@ -20,7 +30,7 @@ use std::{
 };
 
 const PLUGIN_NAME: &str = "xiaoli-model-monitor";
-const PLUGIN_VERSION: &str = "0.1.0-beta.3";
+const PLUGIN_VERSION: &str = "0.2.0-beta.1";
 const MAX_HOOK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MCP_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 // Reserve most of the 150 ms fail-open budget for cold process startup and
@@ -120,13 +130,55 @@ fn sanitize_hook_input(input: &Value) -> Option<Value> {
         64,
     )?;
     let session = clean(first(input, &["session_id", "sessionId", "session"]), 256)?;
+    let (endpoint_class, endpoint_host_hash) = hook_endpoint_evidence();
     Some(json!({
         "event": event,
         "session": session,
         "turn": clean(first(input, &["turn_id", "turnId", "turn"]), 256),
         "model": clean(input.get("model"), 128),
+        "endpointClass": endpoint_class,
+        "endpointHostHash": endpoint_host_hash,
         "timestamp": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     }))
+}
+
+fn hook_endpoint_evidence() -> (Option<connection::EndpointClass>, Option<String>) {
+    let mut observations = Vec::new();
+    for key in [
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "ANTHROPIC_BASE_URL",
+        "AZURE_OPENAI_ENDPOINT",
+    ] {
+        let Ok(value) = std::env::var(key) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() || value.len() > 2_048 {
+            continue;
+        }
+        let class = connection::classify_endpoint(value);
+        let Some(scope) = connection::normalize_endpoint_scope(value) else {
+            continue;
+        };
+        observations.push((class, scope));
+    }
+    if observations.is_empty() {
+        return (None, None);
+    }
+    observations.sort_by(|left, right| left.1.cmp(&right.1));
+    observations.dedup();
+    let first_class = observations[0].0;
+    let class = observations
+        .iter()
+        .all(|(value, _)| *value == first_class)
+        .then_some(first_class)
+        .or(Some(connection::EndpointClass::Unknown));
+    let scopes = observations
+        .iter()
+        .map(|(_, scope)| scope.clone())
+        .collect::<Vec<_>>();
+    (class, connection::combined_endpoint_scope_hash(&scopes))
 }
 
 fn persist_hook_fallback(event: &Value, fallback_dir: Option<&Path>) -> Result<(), String> {
@@ -243,6 +295,33 @@ fn mcp_tool_definitions() -> Value {
                     "theme": {"type": "string", "enum": ["cute", "minimal"], "default": "cute"}
                 }
             }
+        },
+        {
+            "name": "get_connection_origin",
+            "description": "Read configured connection-origin evidence for one active task. This does not identify the physical server model.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": false, "required": ["threadId"],
+                "properties": {
+                    "threadId": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "turnId": {"type": "string", "minLength": 1, "maxLength": 256}
+                }
+            }
+        },
+        {
+            "name": "list_relay_audits",
+            "description": "List sanitized XiaoLi relay-audit summaries and current read-only progress. This tool cannot start an audit or spend quota.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": false,
+                "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20}}
+            }
+        },
+        {
+            "name": "get_relay_audit",
+            "description": "Read one sanitized relay-audit report or current progress by audit id. This tool cannot start or modify an audit.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": false, "required": ["auditId"],
+                "properties": {"auditId": {"type": "string", "minLength": 1, "maxLength": 256}}
+            }
         }
     ])
 }
@@ -264,6 +343,27 @@ fn call_mcp_tool(name: &str, args: &Value) -> Value {
             };
             query_monitor("render_monitor_card", params.clone())
                 .and_then(|snapshot| render_text_card(&snapshot, &params))
+        }
+        "get_connection_origin" => {
+            let params = match session_detail_params(args) {
+                Ok(params) => params,
+                Err(error) => return mcp_tool_error(&error),
+            };
+            query_monitor("get_connection_origin", params)
+        }
+        "list_relay_audits" => {
+            let params = match relay_audit_list_params(args) {
+                Ok(params) => params,
+                Err(error) => return mcp_tool_error(&error),
+            };
+            query_monitor("list_relay_audits", params)
+        }
+        "get_relay_audit" => {
+            let params = match relay_audit_detail_params(args) {
+                Ok(params) => params,
+                Err(error) => return mcp_tool_error(&error),
+            };
+            query_monitor("get_relay_audit", params)
         }
         _ => return mcp_tool_error("unknown tool"),
     };
@@ -298,8 +398,14 @@ fn optional_nonempty_string<'a>(args: &'a Value, key: &str) -> Result<Option<&'a
 fn session_detail_params(args: &Value) -> Result<Value, String> {
     let thread_id = optional_nonempty_string(args, "threadId")?
         .ok_or_else(|| "threadId is required".to_owned())?;
+    if thread_id.chars().count() > 256 {
+        return Err("threadId must not exceed 256 characters".to_owned());
+    }
     let mut params = json!({"threadId": thread_id});
     if let Some(turn_id) = optional_nonempty_string(args, "turnId")? {
+        if turn_id.chars().count() > 256 {
+            return Err("turnId must not exceed 256 characters".to_owned());
+        }
         params
             .as_object_mut()
             .expect("object literal")
@@ -322,6 +428,27 @@ fn monitor_card_params(args: &Value) -> Result<Value, String> {
             .insert("threadId".to_owned(), Value::String(thread_id.to_owned()));
     }
     Ok(params)
+}
+
+fn relay_audit_list_params(args: &Value) -> Result<Value, String> {
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => 20,
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .filter(|value| (1..=200).contains(value))
+            .ok_or_else(|| "limit must be an integer between 1 and 200".to_owned())?,
+        _ => return Err("limit must be an integer between 1 and 200".to_owned()),
+    };
+    Ok(json!({"limit": limit}))
+}
+
+fn relay_audit_detail_params(args: &Value) -> Result<Value, String> {
+    let audit_id = optional_nonempty_string(args, "auditId")?
+        .ok_or_else(|| "auditId is required".to_owned())?;
+    if audit_id.chars().count() > 256 {
+        return Err("auditId must not exceed 256 characters".to_owned());
+    }
+    Ok(json!({"auditId": audit_id}))
 }
 
 fn query_monitor(method: &str, params: Value) -> Result<Value, String> {
@@ -409,6 +536,7 @@ fn project_card_conversations(
 fn render_text_card(snapshot: &Value, params: &Value) -> Result<Value, String> {
     let theme = optional_nonempty_string(params, "theme")?.unwrap_or("cute");
     let thread_id = optional_nonempty_string(params, "threadId")?;
+    let projected_thread_id = snapshot.get("projectionThreadId").and_then(Value::as_str);
     let conversations = project_card_conversations(snapshot, thread_id)?;
     let count = conversations.len();
     let primary = if thread_id.is_some() || count == 1 {
@@ -463,11 +591,11 @@ fn render_text_card(snapshot: &Value, params: &Value) -> Result<Value, String> {
             Value::Array(conversations.clone()),
         );
     Ok(json!({
-        "schemaVersion": snapshot.get("schemaVersion").cloned().unwrap_or(json!(4)),
+        "schemaVersion": snapshot.get("schemaVersion").cloned().unwrap_or(json!(5)),
         "checkedAt": snapshot.get("checkedAt").cloned().unwrap_or(Value::Null),
         "snapshotSource": snapshot.get("snapshotSource").cloned().unwrap_or(Value::Null),
         "theme": theme,
-        "threadId": thread_id,
+        "threadId": projected_thread_id,
         "card": line,
         "conversation": primary.cloned(),
         "children": if primary.is_some() { conversations.iter().skip(1).cloned().collect::<Vec<_>>() } else { Vec::new() },
@@ -487,51 +615,74 @@ fn mcp_tool_error(message: &str) -> Value {
     json!({"content": [{"type": "text", "text": message}], "isError": true})
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PluginHost {
+    executable: PathBuf,
+    appimage_extract_and_run: bool,
+}
+
+impl PluginHost {
+    fn direct(executable: PathBuf) -> Self {
+        Self {
+            executable,
+            appimage_extract_and_run: false,
+        }
+    }
+}
+
 pub(crate) fn install_plugin() -> Result<Value, String> {
-    let executable = plugin_host_executable()?;
+    let host = plugin_host()?;
     let home = dirs::home_dir().ok_or_else(|| "home_directory_unavailable".to_owned())?;
-    install_plugin_at(&home, &executable)
+    install_plugin_host_at(&home, &host)
 }
 
 /// Resolve the stable executable that Codex should invoke after this process
 /// exits. Linux AppImage payloads run from an ephemeral `/tmp/.mount_*` path;
 /// the launcher exposes the persistent archive through `$APPIMAGE`.
-fn plugin_host_executable() -> Result<PathBuf, String> {
+fn plugin_host() -> Result<PluginHost, String> {
     let current = std::env::current_exe().map_err(|error| error.to_string())?;
     let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from);
-    Ok(resolve_plugin_host_executable(
+    Ok(resolve_plugin_host(
         current,
         appimage,
         cfg!(target_os = "linux"),
     ))
 }
 
-fn resolve_plugin_host_executable(
+fn resolve_plugin_host(
     current: PathBuf,
     appimage: Option<PathBuf>,
     prefer_appimage: bool,
-) -> PathBuf {
+) -> PluginHost {
     if prefer_appimage {
         if let Some(stable) = appimage
             .filter(|path| path.is_absolute())
             .and_then(|path| fs::canonicalize(path).ok())
         {
-            return stable;
+            return PluginHost {
+                executable: stable,
+                appimage_extract_and_run: true,
+            };
         }
     }
-    current
+    PluginHost::direct(current)
 }
 
+#[cfg(test)]
 fn install_plugin_at(home: &Path, executable: &Path) -> Result<Value, String> {
-    if !executable.is_absolute() {
+    install_plugin_host_at(home, &PluginHost::direct(executable.to_path_buf()))
+}
+
+fn install_plugin_host_at(home: &Path, host: &PluginHost) -> Result<Value, String> {
+    if !host.executable.is_absolute() {
         return Err("executable_path_must_be_absolute".to_owned());
     }
-    with_plugin_install_lock(home, || install_plugin_at_locked(home, executable))
+    with_plugin_install_lock(home, || install_plugin_at_locked(home, host))
 }
 
-fn install_plugin_at_locked(home: &Path, executable: &Path) -> Result<Value, String> {
+fn install_plugin_at_locked(home: &Path, host: &PluginHost) -> Result<Value, String> {
     let plugin_root = home.join("plugins").join(PLUGIN_NAME);
-    let was_current = plugin_installation_is_current(home, executable);
+    let was_current = plugin_installation_is_current(home, host);
     for directory in [
         plugin_root.join(".codex-plugin"),
         plugin_root.join("hooks"),
@@ -546,11 +697,8 @@ fn install_plugin_at_locked(home: &Path, executable: &Path) -> Result<Value, Str
         &plugin_root.join(".codex-plugin/plugin.json"),
         &plugin_manifest(),
     )?;
-    write_json(&plugin_root.join(".mcp.json"), &mcp_manifest(executable))?;
-    write_json(
-        &plugin_root.join("hooks/hooks.json"),
-        &hooks_manifest(executable),
-    )?;
+    write_json(&plugin_root.join(".mcp.json"), &mcp_manifest(host))?;
+    write_json(&plugin_root.join("hooks/hooks.json"), &hooks_manifest(host))?;
     write_text(
         &plugin_root.join("skills/model-monitor/SKILL.md"),
         PLUGIN_SKILL,
@@ -559,13 +707,13 @@ fn install_plugin_at_locked(home: &Path, executable: &Path) -> Result<Value, Str
     write_text(&plugin_root.join("assets/icon.svg"), PLUGIN_ICON)?;
     update_personal_marketplace(home, true)?;
 
-    if !plugin_installation_is_current(home, executable) {
+    if !plugin_installation_is_current(home, host) {
         return Err("plugin_installation_verification_failed".to_owned());
     }
 
     Ok(json!({
         "ok": true, "action": "installed", "plugin": PLUGIN_NAME,
-        "path": plugin_root, "executable": executable, "changed": !was_current
+        "path": plugin_root, "executable": host.executable, "changed": !was_current
     }))
 }
 
@@ -701,17 +849,28 @@ fn plugin_manifest() -> Value {
     })
 }
 
-fn mcp_manifest(executable: &Path) -> Value {
+fn mcp_manifest(host: &PluginHost) -> Value {
+    let args = if host.appimage_extract_and_run {
+        vec!["--appimage-extract-and-run", "--mcp-server"]
+    } else {
+        vec!["--mcp-server"]
+    };
     json!({"mcpServers": {PLUGIN_NAME: {
-        "type": "stdio", "command": executable, "args": ["--mcp-server"],
+        "type": "stdio", "command": host.executable, "args": args,
         "startup_timeout_sec": 5, "tool_timeout_sec": 3
     }}})
 }
 
-fn hooks_manifest(executable: &Path) -> Value {
+fn hooks_manifest(host: &PluginHost) -> Value {
+    let runtime_argument = if host.appimage_extract_and_run {
+        " --appimage-extract-and-run"
+    } else {
+        ""
+    };
     let command = format!(
-        "{} --hook-capture \"${{PLUGIN_DATA}}\"",
-        shell_command_path(executable)
+        "{}{} --hook-capture \"${{PLUGIN_DATA}}\"",
+        shell_command_path(&host.executable),
+        runtime_argument
     );
     let hook = || {
         json!({"hooks": [{
@@ -739,7 +898,7 @@ fn shell_command_path(path: &Path) -> String {
     }
 }
 
-fn plugin_installation_is_current(home: &Path, executable: &Path) -> bool {
+fn plugin_installation_is_current(home: &Path, host: &PluginHost) -> bool {
     let plugin_root = home.join("plugins").join(PLUGIN_NAME);
     let json_matches = |path: &Path, expected: &Value| {
         fs::read(path)
@@ -751,11 +910,8 @@ fn plugin_installation_is_current(home: &Path, executable: &Path) -> bool {
     if !json_matches(
         &plugin_root.join(".codex-plugin/plugin.json"),
         &plugin_manifest(),
-    ) || !json_matches(&plugin_root.join(".mcp.json"), &mcp_manifest(executable))
-        || !json_matches(
-            &plugin_root.join("hooks/hooks.json"),
-            &hooks_manifest(executable),
-        )
+    ) || !json_matches(&plugin_root.join(".mcp.json"), &mcp_manifest(host))
+        || !json_matches(&plugin_root.join("hooks/hooks.json"), &hooks_manifest(host))
         || fs::read(plugin_root.join("skills/model-monitor/SKILL.md"))
             .ok()
             .as_deref()
@@ -888,19 +1044,21 @@ fn write_text(path: &Path, value: &str) -> Result<(), String> {
 
 const PLUGIN_SKILL: &str = r#"---
 name: model-monitor
-description: Inspect current Codex task request models, explicit server reroute evidence, requested effort, token usage, cache share, timing, and XiaoLi quality assessments through read-only MCP tools.
+description: Inspect current Codex task request models, explicit server reroute evidence, configured connection origin, token usage, timing, quality assessments, and completed relay audits through read-only MCP tools.
 ---
 
 # 小狸模型监视
 
-先调用 `get_monitor_summary`。需要单个任务证据时调用 `get_session_detail`；需要简洁卡片时调用 `render_monitor_card`。
+先调用 `get_monitor_summary`。需要单个任务证据时调用 `get_session_detail`；需要简洁卡片时调用 `render_monitor_card`。需要连接来源时调用 `get_connection_origin`；只读查看中转审计时使用 `list_relay_audits` 和 `get_relay_audit`。
 
 - 请求模型和请求 effort 不是物理后端或实测思考强度证明。
+- 连接来源只是端点与认证配置证据，不是服务器物理模型身份证明。
 - 只有明确的 `model/rerouted` 证据才能称为服务器已重路由。
 - “未见服务器重路由”只代表小狸未捕获显式事件，不证明物理模型没有变化。
 - token、缓存、耗时和行为偏离只能作为遥测或黄色疑似降质提示，不能伪装为服务器路由证据。
 - 只把带有 `snapshotSource: liveMonitorIpc` 的工具结果作为当前状态；小狸离线时明确说明无法查询，不用磁盘旧快照代替。
 - 不输出 prompt、回复正文、cwd、工具内容、transcript 或 rollout 路径。
+- MCP 没有启动、取消或排程审计的工具，不会因为对话内调用而消耗 API 额度。
 "#;
 
 const PLUGIN_README: &str = r#"# 小狸 Codex 插件
@@ -932,11 +1090,13 @@ mod tests {
             value.get("session").and_then(Value::as_str),
             Some("thread-1")
         );
-        assert_eq!(value.as_object().map(|value| value.len()), Some(5));
+        assert_eq!(value.as_object().map(|value| value.len()), Some(7));
+        assert!(value.get("endpointClass").is_some());
+        assert!(value.get("endpointHostHash").is_some());
     }
 
     #[test]
-    fn mcp_server_lists_three_read_only_tools() {
+    fn mcp_server_lists_six_read_only_tools_and_never_exposes_audit_start() {
         let response =
             handle_mcp_request(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
                 .expect("response");
@@ -944,17 +1104,26 @@ mod tests {
             .pointer("/result/tools")
             .and_then(Value::as_array)
             .expect("tools");
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 6);
         assert_eq!(
             tools[0].get("name").and_then(Value::as_str),
             Some("get_monitor_summary")
         );
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"get_connection_origin"));
+        assert!(names.contains(&"list_relay_audits"));
+        assert!(names.contains(&"get_relay_audit"));
+        assert!(!names.iter().any(|name| name.contains("start")));
+        assert!(!names.iter().any(|name| name.contains("cancel")));
     }
 
     #[test]
     fn mcp_marks_live_ipc_results_and_refuses_offline_cache_as_current() {
         let live = query_monitor_with("get_monitor_summary", json!({}), |_| {
-            Ok(json!({"schemaVersion": 4, "checkedAt": "2026-08-25T00:00:00Z", "conversations": []}))
+            Ok(json!({"schemaVersion": 5, "checkedAt": "2026-08-25T00:00:00Z", "conversations": []}))
         })
         .expect("live IPC response");
         assert_eq!(
@@ -990,7 +1159,7 @@ mod tests {
         );
 
         let live = json!({
-            "schemaVersion": 4,
+            "schemaVersion": 5,
             "checkedAt": "2026-08-25T00:00:00Z",
             "snapshotSource": "liveMonitorIpc",
             "conversations": [
@@ -1043,6 +1212,31 @@ mod tests {
     }
 
     #[test]
+    fn mcp_relay_audit_arguments_are_bounded_and_read_only() {
+        assert_eq!(
+            relay_audit_list_params(&json!({})).unwrap(),
+            json!({"limit": 20})
+        );
+        assert_eq!(
+            relay_audit_list_params(&json!({"limit": 200})).unwrap(),
+            json!({"limit": 200})
+        );
+        assert!(relay_audit_list_params(&json!({"limit": 0})).is_err());
+        assert!(relay_audit_list_params(&json!({"limit": 201})).is_err());
+        assert!(relay_audit_list_params(&json!({"limit": 1.5})).is_err());
+        assert_eq!(
+            relay_audit_detail_params(&json!({"auditId": "audit-fixture"})).unwrap(),
+            json!({"auditId": "audit-fixture"})
+        );
+        assert!(relay_audit_detail_params(&json!({})).is_err());
+        assert!(relay_audit_detail_params(&json!({"auditId": "x".repeat(257)})).is_err());
+
+        let blocked = call_mcp_tool("start_relay_audit", &json!({}));
+        assert_eq!(blocked.get("isError").and_then(Value::as_bool), Some(true));
+        assert!(blocked.to_string().contains("unknown tool"));
+    }
+
+    #[test]
     fn appimage_plugin_path_uses_the_persistent_archive_not_the_mount() {
         let temporary =
             std::env::temp_dir().join(format!("xiaoli-appimage-path-test-{}", std::process::id()));
@@ -1053,19 +1247,53 @@ mod tests {
         fs::write(&mounted, b"ephemeral").expect("mounted executable");
         fs::write(&archive, b"persistent").expect("AppImage archive");
 
-        let resolved = resolve_plugin_host_executable(mounted.clone(), Some(archive.clone()), true);
+        let resolved = resolve_plugin_host(mounted.clone(), Some(archive.clone()), true);
         assert_eq!(
-            resolved,
+            resolved.executable,
             fs::canonicalize(&archive).expect("canonical archive")
         );
-        assert!(!resolved.to_string_lossy().contains(".mount_"));
+        assert!(resolved.appimage_extract_and_run);
+        assert!(!resolved.executable.to_string_lossy().contains(".mount_"));
 
-        let fallback = resolve_plugin_host_executable(
+        let fallback = resolve_plugin_host(
             mounted.clone(),
             Some(temporary.join("missing.AppImage")),
             true,
         );
-        assert_eq!(fallback, mounted);
+        assert_eq!(fallback, PluginHost::direct(mounted));
+        let _ = fs::remove_dir_all(&temporary);
+    }
+
+    #[test]
+    fn generated_appimage_plugin_persists_extract_and_run_for_mcp_and_hooks() {
+        let temporary = std::env::temp_dir().join(format!(
+            "xiaoli-appimage-plugin-test-{}",
+            std::process::id()
+        ));
+        let executable = temporary.join("portable/XiaoLi renamed archive");
+        let host = PluginHost {
+            executable: executable.clone(),
+            appimage_extract_and_run: true,
+        };
+        let _ = fs::remove_dir_all(&temporary);
+        fs::create_dir_all(executable.parent().expect("archive parent")).expect("archive tree");
+        fs::write(&executable, b"appimage fixture").expect("archive fixture");
+
+        install_plugin_host_at(&temporary, &host).expect("install AppImage plugin");
+        let plugin = temporary.join("plugins").join(PLUGIN_NAME);
+        let mcp: Value = serde_json::from_slice(
+            &fs::read(plugin.join(".mcp.json")).expect("generated MCP manifest"),
+        )
+        .expect("valid MCP manifest");
+        assert_eq!(
+            mcp.pointer("/mcpServers/xiaoli-model-monitor/args"),
+            Some(&json!(["--appimage-extract-and-run", "--mcp-server"]))
+        );
+        let hooks =
+            fs::read_to_string(plugin.join("hooks/hooks.json")).expect("generated hooks manifest");
+        assert!(hooks.contains("--appimage-extract-and-run --hook-capture"));
+        assert!(plugin_installation_is_current(&temporary, &host));
+
         let _ = fs::remove_dir_all(&temporary);
     }
 
@@ -1091,7 +1319,12 @@ mod tests {
                 .and_then(Value::as_str),
             Some(executable.to_string_lossy().as_ref())
         );
+        assert_eq!(
+            mcp_json.pointer("/mcpServers/xiaoli-model-monitor/args"),
+            Some(&json!(["--mcp-server"]))
+        );
         assert!(hooks.contains("--hook-capture"));
+        assert!(!hooks.contains("--appimage-extract-and-run"));
         assert!(!mcp.to_ascii_lowercase().contains("node"));
         assert!(!hooks.to_ascii_lowercase().contains("node"));
         let unchanged = install_plugin_at(&temporary, &executable).expect("verify plugin");
