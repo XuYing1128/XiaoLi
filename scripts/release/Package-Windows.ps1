@@ -21,6 +21,11 @@ $stageRoot = Join-Path $outputRoot 'windows-portable-stage'
 $packageRoot = Join-Path $stageRoot 'XiaoLi'
 $archivePath = Join-Path $outputRoot "XiaoLi-v$Version-Windows-x64-portable.zip"
 
+& node (Join-Path $PSScriptRoot 'assert-no-private-build-paths.mjs') $executablePath
+if ($LASTEXITCODE -ne 0) {
+    throw 'Executable contains an unremapped private build path'
+}
+
 New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 if (Test-Path -LiteralPath $stageRoot) {
     Remove-Item -LiteralPath $stageRoot -Recurse -Force

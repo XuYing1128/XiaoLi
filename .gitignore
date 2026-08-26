@@ -53,6 +53,7 @@ production-baseline*.json
 # Portable/release output
 release-out*/
 release-staging/
+artifacts-local-*/
 *.AppImage
 *.dmg
 *.msi

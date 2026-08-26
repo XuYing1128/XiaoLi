@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Kept LF-only by the repository's .gitattributes for portable CI execution.
 set -euo pipefail
 
 app_path="${1:?XiaoLi.app path is required}"
@@ -11,6 +12,7 @@ version="${3:?version is required}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 [[ -d "${app_path}" ]] || { echo "Missing app bundle: ${app_path}" >&2; exit 1; }
+node "${repo_root}/scripts/release/assert-no-private-build-paths.mjs" "${app_path}"
 mkdir -p "${output_dir}"
 output_dir="$(cd "${output_dir}" && pwd)"
 archive="${output_dir}/XiaoLi-v${version}-macOS-universal.app.zip"
@@ -39,6 +41,7 @@ cp -R "${repo_root}/plugin/xiaoli-model-monitor" \
   "${stage}/plugin/xiaoli-model-monitor"
 find "${stage}/plugin/xiaoli-model-monitor" -type d -empty -delete
 cp "${notice_dir}/THIRD_PARTY_LICENSES.html" "${stage}/THIRD_PARTY_LICENSES.html"
+node "${repo_root}/scripts/release/assert-no-private-build-paths.mjs" "${stage}"
 rm -f "${archive}"
 (cd "${stage}" && ditto -c -k --sequesterRsrc . "${archive}")
 [[ -s "${archive}" ]]

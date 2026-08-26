@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Kept LF-only by the repository's .gitattributes for portable CI execution.
 set -euo pipefail
 
 archive="${1:?macOS app archive is required}"

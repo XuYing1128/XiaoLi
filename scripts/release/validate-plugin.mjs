@@ -16,7 +16,7 @@ for (const path of required) {
 
 const manifest = JSON.parse(readFileSync(join(root, ".codex-plugin/plugin.json"), "utf8"));
 if (manifest.name !== "xiaoli-model-monitor") throw new Error("Unexpected plugin name");
-if (manifest.version !== "0.1.0-beta.3") throw new Error("Unexpected plugin version");
+if (manifest.version !== "0.2.0-beta.1") throw new Error("Unexpected plugin version");
 if (manifest.license !== "PolyForm-Noncommercial-1.0.0") {
   throw new Error("Unexpected plugin license");
 }
@@ -32,11 +32,53 @@ if (server?.command !== "{{XIAOLI_EXECUTABLE}}" || server?.args?.[0] !== "--mcp-
 
 const hooksText = readFileSync(join(root, "hooks/hooks.json"), "utf8");
 const hooks = JSON.parse(hooksText);
-for (const eventName of ["SessionStart", "UserPromptSubmit", "SubagentStart", "Stop"]) {
-  if (!Array.isArray(hooks.hooks?.[eventName])) throw new Error(`Missing ${eventName} hook`);
+const expectedHooks = [
+  "SessionStart",
+  "UserPromptSubmit",
+  "SubagentStart",
+  "SubagentStop",
+  "Stop",
+];
+const actualHooks = Object.keys(hooks.hooks ?? {}).sort();
+if (JSON.stringify(actualHooks) !== JSON.stringify([...expectedHooks].sort())) {
+  throw new Error(`Expected exactly five metadata hooks; received: ${actualHooks.join(", ")}`);
+}
+for (const eventName of expectedHooks) {
+  const registrations = hooks.hooks[eventName];
+  if (!Array.isArray(registrations) || registrations.length === 0) {
+    throw new Error(`Missing ${eventName} hook`);
+  }
+  const commands = registrations.flatMap((entry) => entry.hooks ?? []);
+  if (
+    commands.length === 0 ||
+    commands.some(
+      (hook) =>
+        hook.type !== "command" ||
+        !String(hook.command ?? "").includes("{{XIAOLI_EXECUTABLE}}") ||
+        !String(hook.command ?? "").includes("--hook-capture"),
+    )
+  ) {
+    throw new Error(`${eventName} is not wired to the fail-open Rust hook handler`);
+  }
 }
 if (!hooksText.includes("{{XIAOLI_EXECUTABLE}}") || !hooksText.includes("--hook-capture")) {
   throw new Error("Plugin hooks are not wired to the Rust executable placeholder");
+}
+
+const skillText = readFileSync(join(root, "skills/model-monitor/SKILL.md"), "utf8");
+const readmeText = readFileSync(join(root, "README.md"), "utf8");
+const expectedTools = [
+  "get_monitor_summary",
+  "get_session_detail",
+  "render_monitor_card",
+  "get_connection_origin",
+  "list_relay_audits",
+  "get_relay_audit",
+];
+for (const tool of expectedTools) {
+  if (!skillText.includes(`\`${tool}`) || !readmeText.includes(`\`${tool}`)) {
+    throw new Error(`Plugin documentation is missing read-only MCP tool: ${tool}`);
+  }
 }
 
 const files = [];
