@@ -1215,22 +1215,26 @@ mod tests {
         io::Cursor,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc,
+            mpsc, Arc,
         },
         thread,
     };
 
-    struct SlowReader {
+    struct GatedReader {
         payload: Option<Vec<u8>>,
-        delay: Duration,
+        release: mpsc::Receiver<()>,
+        released: Arc<AtomicBool>,
     }
 
-    impl Read for SlowReader {
+    impl Read for GatedReader {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
             let Some(payload) = self.payload.take() else {
                 return Ok(0);
             };
-            thread::sleep(self.delay);
+            self.release
+                .recv()
+                .map_err(|_| io::Error::other("test gate closed"))?;
+            self.released.store(true, Ordering::SeqCst);
             let length = payload.len().min(buffer.len());
             buffer[..length].copy_from_slice(&payload[..length]);
             Ok(length)
@@ -1258,23 +1262,35 @@ mod tests {
 
     #[test]
     fn hook_fail_open_deadline_bounds_a_stalled_stdin_read() {
-        let started = Instant::now();
-        let outcome = run_hook_with_budget(Duration::from_millis(30), |deadline| {
-            process_hook_input(
-                SlowReader {
-                    payload: Some(br#"{}"#.to_vec()),
-                    delay: Duration::from_millis(250),
-                },
-                None,
-                deadline,
-            )
+        let (release_tx, release_rx) = mpsc::channel();
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let reader_released = Arc::new(AtomicBool::new(false));
+        let observed_release = reader_released.clone();
+        let supervisor = thread::spawn(move || {
+            let outcome = run_hook_with_budget(Duration::from_millis(30), |deadline| {
+                process_hook_input(
+                    GatedReader {
+                        payload: Some(br#"{}"#.to_vec()),
+                        release: release_rx,
+                        released: observed_release,
+                    },
+                    None,
+                    deadline,
+                )
+            });
+            let _ = outcome_tx.send(outcome);
         });
+
+        let outcome = outcome_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fail-open supervisor waited for the gated reader");
         assert_eq!(outcome, HookWorkerOutcome::DeadlineReached);
         assert!(
-            started.elapsed() < Duration::from_millis(120),
-            "fail-open supervisor waited {:?}",
-            started.elapsed()
+            !reader_released.load(Ordering::SeqCst),
+            "gated reader completed before the fail-open supervisor returned"
         );
+        release_tx.send(()).expect("release gated reader");
+        supervisor.join().expect("join fail-open supervisor");
     }
 
     #[test]
@@ -1312,23 +1328,37 @@ mod tests {
 
     #[test]
     fn hook_deadline_bounds_a_slow_atomic_fallback() {
-        let deadline = Instant::now() + Duration::from_millis(25);
-        let started = Instant::now();
-        let result = persist_hook_fallback_with_deadline_using(
-            json!({"event":"Stop"}),
-            None,
-            deadline,
-            |_, _| {
-                thread::sleep(Duration::from_millis(200));
-                Ok(())
-            },
-        );
+        let (release_tx, release_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let fallback_completed = Arc::new(AtomicBool::new(false));
+        let observed_completion = fallback_completed.clone();
+        let supervisor = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(25);
+            let result = persist_hook_fallback_with_deadline_using(
+                json!({"event":"Stop"}),
+                None,
+                deadline,
+                move |_, _| {
+                    release_rx
+                        .recv()
+                        .map_err(|_| "test gate closed".to_owned())?;
+                    observed_completion.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            );
+            let _ = result_tx.send(result);
+        });
+
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fallback deadline waited for the gated task");
         assert_eq!(result.unwrap_err(), "hook_fallback_timeout");
         assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "fallback deadline waited {:?}",
-            started.elapsed()
+            !fallback_completed.load(Ordering::SeqCst),
+            "gated fallback completed before the deadline returned"
         );
+        release_tx.send(()).expect("release gated fallback");
+        supervisor.join().expect("join fallback supervisor");
     }
 
     #[test]
