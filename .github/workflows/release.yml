@@ -207,8 +207,9 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 120
     env:
-      # Both slices are linked against the oldest macOS version XiaoLi claims
-      # to support, independently of the macOS 15 runner SDK default.
+      # Keep this aligned with bundle.macOS.minimumSystemVersion. The Tauri
+      # config is authoritative because tauri-build forwards it to rustc and
+      # would otherwise replace this runner-level value with its 10.13 default.
       MACOSX_DEPLOYMENT_TARGET: "12.0"
     steps:
       - name: Check out source
@@ -243,25 +244,10 @@ jobs:
         run: node scripts/release/assert-no-private-build-paths.mjs src-tauri/target/universal-apple-darwin/release/bundle/macos/XiaoLi.app
       - name: Verify Universal executable and ad-hoc signature
         shell: bash
-        run: |
-          app="src-tauri/target/universal-apple-darwin/release/bundle/macos/XiaoLi.app"
-          test -d "${app}"
-          binary="${app}/Contents/MacOS/xiaoli"
-          lipo "${binary}" -verify_arch arm64 x86_64
-          for arch in arm64 x86_64; do
-            thin="${RUNNER_TEMP}/xiaoli-${arch}"
-            lipo "${binary}" -thin "${arch}" -output "${thin}"
-            description="$(file "${thin}")"
-            [[ "${description}" == *"Mach-O 64-bit"* ]]
-            [[ "${description}" == *"${arch}"* ]]
-            [[ "${description}" == *"executable"* ]]
-            load_commands="$(otool -l "${thin}")"
-            if [[ "${load_commands}" != *"LC_BUILD_VERSION"* ]]; then
-              echo "::error::${arch} slice is missing LC_BUILD_VERSION"
-              exit 1
-            fi
-          done
-          codesign --verify --deep --strict "${app}"
+        run: >-
+          bash ./scripts/release/verify-macos-bundle.sh
+          src-tauri/target/universal-apple-darwin/release/bundle/macos/XiaoLi.app
+          12.0
       - name: Package macOS app ZIP
         shell: bash
         run: >-

@@ -20,9 +20,13 @@ MSI, DMG, DEB, or RPM installers.
   complete remote asset set has the same names and SHA256 values; any
   difference fails instead of overwriting the published files.
 
-The Universal macOS job runs on `macos-15`, targets macOS 12.0 for both slices,
-and verifies the final executable contains independently valid `arm64` and
-`x86_64` Mach-O slices before checking its ad-hoc signature.
+The Universal macOS job runs on `macos-15` and pins macOS 12.0 in both the
+Tauri bundle configuration and the runner environment. A shared verifier
+checks that the app contains exactly one valid `arm64` and one valid `x86_64`
+Mach-O slice, accepts either valid deployment-target load-command encoding,
+requires both slices and `LSMinimumSystemVersion` to resolve to 12.0, and then
+checks the ad-hoc signature. The same verifier runs again after extracting the
+final portable ZIP, so the uploaded app is the artifact that passes the gate.
 
 Every third-party GitHub Action is pinned to a full commit SHA.
 

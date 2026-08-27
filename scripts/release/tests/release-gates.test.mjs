@@ -404,6 +404,154 @@ printf '%s' '${compressedPayload}' | base64 --decode | gzip --decompress > squas
   },
 );
 
+test(
+  "macOS bundle verifier accepts both deployment encodings and rejects semantic mismatches",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRoot(t, "xiaoli-macos-verifier-");
+    const app = join(root, "XiaoLi.app");
+    const binary = join(app, "Contents", "MacOS", "xiaoli");
+    const plist = join(app, "Contents", "Info.plist");
+    const toolDirectory = join(root, "tools");
+    mkdirSync(dirname(binary), { recursive: true });
+    mkdirSync(toolDirectory, { recursive: true });
+    writeFileSync(binary, "fixture executable\n");
+    chmodSync(binary, 0o755);
+    writeFileSync(plist, "fixture plist\n");
+
+    const writeTool = (name, source) => {
+      const path = join(toolDirectory, name);
+      writeFileSync(path, source);
+      chmodSync(path, 0o755);
+    };
+    writeTool(
+      "lipo",
+      `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${2:-}" == "-verify_arch" ]]; then
+  exit "\${XIAOLI_TEST_LIPO_VERIFY_EXIT:-0}"
+fi
+if [[ "\${1:-}" == "-archs" ]]; then
+  printf '%s\\n' "\${XIAOLI_TEST_ARCHS:-arm64 x86_64}"
+  exit 0
+fi
+if [[ "\${2:-}" == "-thin" && "\${4:-}" == "-output" ]]; then
+  cp "\${1}" "\${5}"
+  chmod +x "\${5}"
+  exit 0
+fi
+exit 2
+`,
+    );
+    writeTool(
+      "file",
+      `#!/usr/bin/env bash
+if [[ -n "\${XIAOLI_TEST_FILE_DESCRIPTION:-}" ]]; then
+  printf '%s\\n' "\${XIAOLI_TEST_FILE_DESCRIPTION}"
+  exit 0
+fi
+case "\${1}" in
+  *arm64) printf '%s: Mach-O 64-bit executable arm64\\n' "\${1}" ;;
+  *x86_64) printf '%s: Mach-O 64-bit executable x86_64\\n' "\${1}" ;;
+  *) exit 2 ;;
+esac
+`,
+    );
+    writeTool(
+      "xcrun",
+      `#!/usr/bin/env bash
+set -euo pipefail
+[[ "\${1:-}" == "vtool" && "\${2:-}" == "-arch" && "\${4:-}" == "-show-build" ]]
+case "\${3}" in
+  arm64) printf '%s\\n' "\${XIAOLI_TEST_VTOOL_ARM64}" ;;
+  x86_64) printf '%s\\n' "\${XIAOLI_TEST_VTOOL_X86_64}" ;;
+  *) exit 2 ;;
+esac
+`,
+    );
+    writeTool(
+      "plutil",
+      `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "\${XIAOLI_TEST_PLIST_MINOS}"
+`,
+    );
+    writeTool(
+      "codesign",
+      `#!/usr/bin/env bash
+set -euo pipefail
+exit "\${XIAOLI_TEST_CODESIGN_EXIT:-0}"
+`,
+    );
+
+    const modern = `Load command 1
+      cmd LC_BUILD_VERSION
+ platform MACOS
+    minos 12.0`;
+    const legacy = `Load command 1
+      cmd LC_VERSION_MIN_MACOSX
+  version 12.0`;
+    const runVerifier = (overrides = {}) =>
+      spawnSync(
+        "bash",
+        [join(repositoryRoot, "scripts", "release", "verify-macos-bundle.sh"), app, "12.0"],
+        {
+          cwd: repositoryRoot,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            PATH: `${toolDirectory}:${process.env.PATH}`,
+            XIAOLI_TEST_ARCHS: "arm64 x86_64",
+            XIAOLI_TEST_VTOOL_ARM64: modern,
+            XIAOLI_TEST_VTOOL_X86_64: modern,
+            XIAOLI_TEST_PLIST_MINOS: "12.0",
+            ...overrides,
+          },
+        },
+      );
+
+    let run = runVerifier();
+    assert.equal(run.status, 0, run.stderr || run.stdout);
+    run = runVerifier({ XIAOLI_TEST_VTOOL_X86_64: legacy });
+    assert.equal(run.status, 0, run.stderr || run.stdout);
+    run = runVerifier({ XIAOLI_TEST_LIPO_VERIFY_EXIT: "1" });
+    assert.notEqual(run.status, 0, "lipo verification failure was ignored");
+    run = runVerifier({ XIAOLI_TEST_CODESIGN_EXIT: "1" });
+    assert.notEqual(run.status, 0, "codesign verification failure was ignored");
+
+    const failures = [
+      [{ XIAOLI_TEST_ARCHS: "arm64" }, /expected exactly arm64 and x86_64 slices/u],
+      [{ XIAOLI_TEST_ARCHS: "arm64 ppc64" }, /missing x86_64/u],
+      [
+        {
+          XIAOLI_TEST_VTOOL_ARM64: modern.replace("platform MACOS", "platform IOS"),
+        },
+        /does not target macOS/u,
+      ],
+      [{ XIAOLI_TEST_VTOOL_ARM64: "cmd LC_UUID" }, /no recognized macOS deployment target/u],
+      [
+        { XIAOLI_TEST_FILE_DESCRIPTION: "fixture: data" },
+        /slice is not Mach-O 64-bit/u,
+      ],
+      [
+        { XIAOLI_TEST_VTOOL_X86_64: modern.replace("minos 12.0", "minos 13.0") },
+        /minimum macOS version is 13\.0/u,
+      ],
+      [
+        { XIAOLI_TEST_VTOOL_X86_64: modern.replace("minos 12.0", "minos malformed") },
+        /minimum macOS version is missing or malformed/u,
+      ],
+      [{ XIAOLI_TEST_PLIST_MINOS: "13.0" }, /LSMinimumSystemVersion is 13\.0/u],
+      [{ XIAOLI_TEST_PLIST_MINOS: "not-a-version" }, /missing or malformed/u],
+    ];
+    for (const [environment, pattern] of failures) {
+      run = runVerifier(environment);
+      assert.notEqual(run.status, 0, `unexpected pass for ${JSON.stringify(environment)}`);
+      assert.match(`${run.stdout}\n${run.stderr}`, pattern);
+    }
+  },
+);
+
 test("release validator checks SPDX root, graph references, and lock coverage", (t) => {
   const sourceRoot = temporaryRoot(t, "xiaoli-sbom-source-");
   writeSourceFixture(sourceRoot);
@@ -470,21 +618,55 @@ test("release workflow gates published assets and builds Universal on macOS 15",
   assert(ciBinaryScan > ciBuild, "CI does not scan the resulting native executable");
   assert.match(workflow, /runs-on: macos-15/);
   assert.match(workflow, /MACOSX_DEPLOYMENT_TARGET: "12\.0"/);
-  assert.match(workflow, /lipo "\$\{binary\}" -verify_arch arm64 x86_64/);
+  const tauriConfig = JSON.parse(
+    readFileSync(join(repositoryRoot, "src-tauri", "tauri.conf.json"), "utf8"),
+  );
+  assert.equal(
+    tauriConfig.bundle?.macOS?.minimumSystemVersion,
+    "12.0",
+    "Tauri must not replace the claimed macOS 12 deployment target with its 10.13 default",
+  );
+  assert.match(workflow, /bash \.\/scripts\/release\/verify-macos-bundle\.sh/);
+  const macBundleVerifier = readFileSync(
+    join(repositoryRoot, "scripts", "release", "verify-macos-bundle.sh"),
+    "utf8",
+  );
+  assert.match(macBundleVerifier, /lipo "\$\{binary\}" -verify_arch arm64 x86_64/);
+  assert.match(macBundleVerifier, /archs="\$\(lipo -archs "\$\{binary\}"\)"/);
+  assert.match(
+    macBundleVerifier,
+    /xcrun vtool -arch "\$\{arch\}" -show-build "\$\{binary\}"/,
+    "the release gate must inspect each architecture's semantic build target",
+  );
   assert.doesNotMatch(
-    workflow,
-    /lipo -verify_arch arm64 x86_64 "\$\{binary\}"/,
-    "lipo requires the input file before the -verify_arch command",
+    macBundleVerifier,
+    /xcrun vtool -show-build -arch/,
+    "vtool options must use the documented order so CI does not rely on permissive parsing",
+  );
+  assert.match(macBundleVerifier, /LC_BUILD_VERSION/);
+  assert.match(
+    macBundleVerifier,
+    /LC_VERSION_MIN_MACOSX/,
+    "both valid Mach-O deployment-target encodings must be accepted",
   );
   assert.match(
-    workflow,
-    /load_commands="\$\(otool -l "\$\{thin\}"\)"/,
-    "the macOS load-command check must consume otool output before matching it",
+    macBundleVerifier,
+    /plutil -extract LSMinimumSystemVersion raw/,
+    "the bundle metadata must agree with both Mach-O slices",
   );
   assert.doesNotMatch(
-    workflow,
+    macBundleVerifier,
     /otool -l "\$\{thin\}" \| grep -q "LC_BUILD_VERSION"/,
     "grep -q can SIGPIPE otool under bash pipefail and turn a successful match into a failed step",
+  );
+  const macArchiveSmoke = readFileSync(
+    join(repositoryRoot, "scripts", "release", "test-macos-archive.sh"),
+    "utf8",
+  );
+  assert.match(
+    macArchiveSmoke,
+    /verify-macos-bundle\.sh" "\$\{app\}" 12\.0/,
+    "the final extracted Release archive must receive the same semantic bundle verification",
   );
   assert.match(workflow, /syft-version: v1\.51\.0/);
   assert.equal(

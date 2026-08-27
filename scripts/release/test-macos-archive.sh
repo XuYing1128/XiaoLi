@@ -25,12 +25,7 @@ grep -Fq 'data-complete-license-catalog="true"' \
 node "${repo_root}/scripts/release/validate-plugin.mjs" \
   "${extract_root}/plugin/xiaoli-model-monitor"
 
-archs="$(lipo -archs "${binary}")"
-[[ "${archs}" == *arm64* && "${archs}" == *x86_64* ]] || {
-  echo "Expected a Universal executable, received: ${archs}" >&2
-  exit 1
-}
-codesign --verify --deep --strict "${app}"
+bash "${repo_root}/scripts/release/verify-macos-bundle.sh" "${app}" 12.0
 
 pwsh -NoLogo -NoProfile -NonInteractive -File \
   "${repo_root}/scripts/release/Test-Portable.ps1" \
