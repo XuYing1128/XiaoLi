@@ -111,18 +111,45 @@ $hookPayload = @{
     model = 'gpt-5.6-sol'
     effort = 'ultra'
 } | ConvertTo-Json -Compress
-$hookResult = Invoke-PortableProcess -Name 'hook' -InputText $hookPayload `
-    -Arguments @('--hook-capture', $statePath)
-if ($hookResult.ExitCode -ne 0) {
-    throw "Hook capture failed with exit code $($hookResult.ExitCode): $($hookResult.Stderr)"
-}
-$hook = $hookResult.Stdout | ConvertFrom-Json
-if ($hook.continue -ne $true -or $hook.suppressOutput -ne $true) {
-    throw 'Hook capture did not return the fail-open response'
-}
 $isolatedHookState = Join-Path $statePath 'hook-latest.json'
+if (Test-Path -LiteralPath $isolatedHookState -PathType Leaf) {
+    # A reused scratch directory must not let a stale fallback satisfy this run.
+    Remove-Item -LiteralPath $isolatedHookState -Force
+}
+
+# The production hook has one shared 150 ms deadline for stdin, IPC and the
+# optional atomic fallback. Under a saturated CI scheduler, an individual
+# fail-open invocation may legitimately spend that budget before fallback can
+# start. Retry complete, independent invocations instead of waiting for a
+# worker after its process has exited; at least one fresh fallback must still
+# prove that the archive can persist hook evidence offline.
+$hookFallbackAttempts = 4
+for ($attempt = 1; $attempt -le $hookFallbackAttempts; $attempt++) {
+    $hookResult = Invoke-PortableProcess -Name "hook-$attempt" -InputText $hookPayload `
+        -Arguments @('--hook-capture', $statePath)
+    if ($hookResult.ExitCode -ne 0) {
+        throw "Hook capture attempt $attempt failed with exit code $($hookResult.ExitCode): $($hookResult.Stderr)"
+    }
+    $hook = $hookResult.Stdout | ConvertFrom-Json
+    if ($hook.continue -ne $true -or $hook.suppressOutput -ne $true) {
+        throw "Hook capture attempt $attempt did not return the fail-open response"
+    }
+    if (Test-Path -LiteralPath $isolatedHookState -PathType Leaf) {
+        break
+    }
+    if ($attempt -lt $hookFallbackAttempts) {
+        Start-Sleep -Milliseconds 50
+    }
+}
 if (-not (Test-Path -LiteralPath $isolatedHookState -PathType Leaf)) {
-    throw "Hook capture did not write to isolated XIAOLI_STATE_DIR: $statePath"
+    throw "No hook capture attempt wrote to isolated XIAOLI_STATE_DIR after $hookFallbackAttempts fail-open attempts: $statePath"
+}
+$persistedHook = Get-Content -LiteralPath $isolatedHookState -Raw | ConvertFrom-Json
+if ($persistedHook.event -ne 'UserPromptSubmit' -or
+    $persistedHook.session -ne '00000000-0000-0000-0000-000000000001' -or
+    $persistedHook.turn -ne '00000000-0000-0000-0000-000000000002' -or
+    $persistedHook.model -ne 'gpt-5.6-sol') {
+    throw 'Hook fallback did not preserve the expected metadata-only evidence'
 }
 
 # A stopped GUI must never let MCP present a disk snapshot as current. Seed an

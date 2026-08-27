@@ -313,6 +313,20 @@ const BUDGETS: Record<AuditMode, BudgetPreset> = {
     detectors: ["protocol", "usage", "quality", "fingerprint", "mmd", "cacheEvasion", "stability", "paraphraseDrift"],
   },
 };
+const AUDIT_MODE_GUIDANCE: Record<AuditMode, { capability: string; limitation: string }> = {
+  quick: {
+    capability: "连接、协议、usage 算术、基础能力与少量单 token 指纹采样",
+    limitation: "每个质量域样本不足以形成一致或降质裁决；质量轴保持学习中，不运行 MMD 与抗规避统计",
+  },
+  standard: {
+    capability: "完整协议与计量、六个质量域、JSD/MMD 分布比较和两批抗规避检查",
+    limitation: "行为质量与中/高置信 JSD/MMD 比较需要实时官方配对；已验签静态参考只提供低置信 JSD 身份比较；通过仍不能证明物理模型",
+  },
+  deep: {
+    capability: "标准档全部能力，加大指纹与质量样本、稳定性矩阵和语义改写漂移检查",
+    limitation: "中/高置信比较仍需实时官方配对；费用、耗时和被端点识别审计流量的概率最高；仍无法排除选择性诚实",
+  },
+};
 const BUILT_IN_REQUESTS: Record<AuditMode, number> = { quick: 140, standard: 308, deep: 716 };
 const EMPTY_AXIS: AxisFinding = { level: "gray", state: "notRun", summary: "尚未运行主动检测", details: [] };
 
@@ -590,7 +604,9 @@ function relayPage(): string {
               <div class="budget-item"><span>最大请求</span><strong class="budget-requests">150</strong></div>
               <div class="budget-item"><span>输入 token 上限</span><strong class="budget-input">1.2m</strong></div>
               <div class="budget-item"><span>输出 token 上限</span><strong class="budget-output">120k</strong></div>
+              <div class="budget-item"><span>整次超时硬上限</span><strong class="budget-timeout">30 分钟</strong></div>
             </div>
+            <div class="audit-mode-guidance" aria-live="polite"><strong class="audit-mode-capability">快速：连接、协议、usage 算术、基础能力与少量单 token 指纹采样</strong><span class="audit-mode-limitation">局限：每个质量域样本不足以形成一致或降质裁决；质量轴保持学习中，不运行 MMD 与抗规避统计</span></div>
             <p class="audit-warning">检测会产生真实 API 费用。“通过”只表示本次范围内未见显著异常，无法密码学证明物理模型。</p>
             <div class="form-actions"><button class="primary-button" type="button" data-action="audit-start"><span class="button-icon">${icon("play")}</span><span class="button-label">开始审计</span></button></div>
             <div class="progress-shell" aria-live="polite" aria-atomic="false" hidden>
@@ -652,12 +668,39 @@ function principlesPage(): string {
         <div class="evidence-layer"><strong>4</strong><div><strong>行为证据</strong><span>token、时序、质量和分布差异</span></div></div>
       </div>
     </article>
-    <div class="status-guide-grid">
-      ${statusGuide("green", "绿色 · 该轴未见异常", "协议/usage 自洽可独立为绿；模型身份可显示与实时官方参考一致，或与已验签静态参考一致（低置信），两者都不是物理模型证明；静态一致不能单独令总裁决为正常。")}
-      ${statusGuide("yellow", "黄色 · 疑似异常", "可能是过量计数、实时配对下的行为降质、指纹偏离，或主动审计正常但同一中转的真实会话长期异常。这些都是保守警告，不是物理模型证明。")}
-      ${statusGuide("red", "红色 · 明确契约异常", "可复现的 usage 不可能算术、协议包络/SSE 或自报型号契约矛盾。")}
-      ${statusGuide("gray", "灰色 · 证据不足", "没有实时匹配参考或可用的可信签名静态参考、样本不足、参数不可控或当前协议无法检查；灰色不是通过。")}
-    </div>
+    <section class="status-guide-section" aria-labelledby="monitor-quality-title">
+      <div class="section-heading"><div><h2 id="monitor-quality-title">会话行为质量 · qualityAssessment</h2><p>这是 Codex 被动监视的本地统计状态，不是中转审计总裁决，也不会改写服务器路由。</p></div></div>
+      <div class="status-guide-grid status-guide-grid-three">
+        ${statusGuide("gray", "learning · 学习中", "同桶合格样本不足 30 个或字段不可比；不做异常结论，灰色不是通过。")}
+        ${statusGuide("green", "consistent · 与本机历史一致", "样本满足门槛，当前检查点未越过保守触发条件；只说明本地行为范围一致，不认证模型身份。")}
+        ${statusGuide("yellow", "suspectedDegradation · 疑似降质", "至少两个独立信号族连续命中本机历史 4×MAD 门槛；只发出黄色统计警告，不能声称已换模型或降低 effort。")}
+      </div>
+    </section>
+    <section class="status-guide-section" aria-labelledby="route-source-title">
+      <div class="section-heading"><div><h2 id="route-source-title">服务器路由与连接来源</h2><p>路由事件和连接配置是两条独立证据线；连接来源不会根据速度、文风或 token 特征猜测。</p></div></div>
+      <div class="status-guide-grid status-guide-grid-three">
+        ${statusGuide("gray", "未见服务器重路由", "没有捕获显式 model/rerouted；不证明物理路由没有变化。")}
+        ${statusGuide("route", "服务器已重路由", "捕获到显式 model/rerouted 且目标可显示；蓝紫色只标识路由证据，目标与策略冲突时才升级为红色。")}
+        ${statusGuide("yellow", "已重路由，目标未知", "明确事件确认发生过重路由，但目标字段缺失；小狸不会用请求模型或行为特征补猜目标。")}
+      </div>
+      <div class="origin-guide" aria-label="连接来源分类">
+        <strong>连接来源固定分类</strong>
+        <span>OpenAI 官方 ChatGPT 登录</span><span>OpenAI 官方 API</span><span>Anthropic 官方 API</span><span>托管模型提供方</span><span>自定义端点</span><span>本地端点</span><span>连接来源未知</span>
+      </div>
+    </section>
+    <section class="status-guide-section" aria-labelledby="audit-verdict-title">
+      <div class="section-heading"><div><h2 id="audit-verdict-title">中转审计总裁决 · overallVerdict</h2><p>八种枚举逐项展示；总裁决汇总四条证据轴与运行生命周期，不输出“真实模型概率”。</p></div></div>
+      <div class="status-guide-grid">
+        ${statusGuide("green", "consistent · 与本次参考一致", "本次参数和实时匹配参考的适用范围内未见显著异常；物理模型未获证明。模型身份轴可以显示与已验签静态参考一致（低置信），但静态一致不能单独令总裁决为正常；可用的可信签名静态参考必须验签、匹配参数且未过期。")}
+        ${statusGuide("gray", "insufficientEvidence · 证据不足", "样本、实时参考或受控参数不足；灰色不是通过。")}
+        ${statusGuide("yellow", "suspectedPadding · 疑似过量计数", "至少两个受控输入量级的计量偏差越过配对参考与容差；不证明服务商主观故意。")}
+        ${statusGuide("yellow", "suspectedDegradation · 疑似降质", "实时配对下至少两个已实现能力域持续低于参考；不等于已换成某个命名模型。")}
+        ${statusGuide("yellow", "significantlyDifferent · 与参考显著不同", "实时配对下 JSD 与 MMD 同时越过门槛，或适用的已验签静态参考下 JSD 越过其签名校准阈值（低置信）；不会填充虚假的 actualModel。")}
+        ${statusGuide("red", "confirmedContractMismatch · 明确契约异常", "协议或 usage 存在可复现的不可能矛盾；不自动推导后端实体。")}
+        ${statusGuide("red", "failed · 检测失败", "没有成功的可解析响应，或审计发生确定性失败；没有形成模型结论。")}
+        ${statusGuide("gray", "cancelled · 已取消", "用户取消后不再启动新请求；已完成的结构化证据可以保留，但整次运行不作通过结论。")}
+      </div>
+    </section>
     <div class="method-grid">
       <article class="card method-card"><h3>如何寻找 token 注水</h3><ul><li>先验证 usage 各项算术是否自洽。</li><li>对已知 OpenAI tokenizer 计算可见 token，未知别名不宣称绝对精确。</li><li>多个输入量级对比官方配对或可解释区间。</li></ul></article>
       <article class="card method-card"><h3>如何寻找降质</h3><ul><li>使用结构化 JSON、长上下文 nonce、算术/约束推理、多语言、工具选择与状态保持六个域。</li><li>工具域通过三种协议发送真实工具 schema，只在本地评分结构化工具名/参数，绝不执行调用。</li><li>状态保持只验证同一请求内的多消息历史，不代表跨网络会话或物理模型证明；实时官方配对下至少两个域持续偏离才发出黄色提示。</li></ul></article>
@@ -668,7 +711,7 @@ function principlesPage(): string {
   </section>`;
 }
 
-function statusGuide(level: StatusLevel, title: string, copy: string): string {
+function statusGuide(level: StatusLevel | "route", title: string, copy: string): string {
   return `<article class="status-guide-card status-${level}"><h3><span class="status-dot"></span>${title}</h3><p>${copy}</p></article>`;
 }
 
@@ -1396,6 +1439,11 @@ function formatDuration(value: number | undefined): string {
   return `${Math.floor(value / 60_000)}m ${Math.round((value % 60_000) / 1_000)}s`;
 }
 
+function formatAuditTimeout(value: number): string {
+  const minutes = Math.max(1, Math.round(value / 60_000));
+  return minutes % 60 === 0 ? `${minutes / 60} 小时` : `${minutes} 分钟`;
+}
+
 function relativeTime(value: string | undefined): string {
   if (!value) return "时间未知";
   const timestamp = Date.parse(value);
@@ -2017,11 +2065,15 @@ function isOfficialProfile(profile: RelayProfile): boolean {
 function renderBudget(): void {
   const mode = selectedAuditMode();
   const preset = BUDGETS[mode];
+  const guidance = AUDIT_MODE_GUIDANCE[mode];
   const paired = Boolean((mount.querySelector<HTMLSelectElement>("#audit-baseline")?.value));
   const multiplier = paired ? 2 : 1;
   setText(".budget-requests", paired ? `${preset.requestLimit} / 端点·${preset.requestLimit * multiplier} 总计` : String(preset.requestLimit));
   setText(".budget-input", `${formatTokens(preset.inputTokenLimit * multiplier)}${paired ? " 总计" : ""}`);
   setText(".budget-output", `${formatTokens(preset.outputTokenLimit * multiplier)}${paired ? " 总计" : ""}`);
+  setText(".budget-timeout", formatAuditTimeout(preset.timeoutMs));
+  setText(".audit-mode-capability", `${preset.label}：${guidance.capability}`);
+  setText(".audit-mode-limitation", `局限：${guidance.limitation}`);
 }
 
 function renderProgress(): void {
@@ -2715,7 +2767,10 @@ async function startAudit(): Promise<void> {
       `完整计划：${preview.plannedRequests} 次 / 端点（内置 ${preview.builtInRequests} + 私有 ${preview.privateProbeRequests}），${preview.plannedRequests * multiplier} 次总操作\n` +
       `硬上限：${budget.requestLimit} 次 / 端点，${budget.requestLimit * multiplier} 次总请求\n` +
       `输入 token 上限：${formatTokens(budget.inputTokenLimit * multiplier)} 总计\n` +
-      `输出 token 上限：${formatTokens(budget.outputTokenLimit * multiplier)} 总计\n\n` +
+      `输出 token 上限：${formatTokens(budget.outputTokenLimit * multiplier)} 总计\n` +
+      `整次超时硬上限：${formatAuditTimeout(budget.timeoutMs)}（不是单请求超时）\n` +
+      `本档能力：${AUDIT_MODE_GUIDANCE[mode].capability}\n` +
+      `本档局限：${AUDIT_MODE_GUIDANCE[mode].limitation}\n\n` +
       "网络重试也计入上限；结果不能密码学证明物理模型。",
     );
     if (!confirmed) {

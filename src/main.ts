@@ -1721,6 +1721,7 @@ function mountShell(): void {
         <article class="status-guide-item status-red"><i aria-hidden="true">×</i><div><strong>异常</strong><p>同一回合请求证据明确冲突、显式重路由违反策略，或采集器发生无法继续工作的确定性故障。</p></div></article>
         <article class="status-guide-item status-gray"><i aria-hidden="true">–</i><div><strong>空闲</strong><p>Codex 未运行，或当前没有活动回合。小狸会继续在后台等待结构化事件。</p></div></article>
         <article class="status-guide-item route-guide"><i aria-hidden="true">↝</i><div><strong>服务器已重路由</strong><p>只在捕获明确的 <code>model/rerouted</code> 事件时出现，并显示请求模型到服务器目标的链。</p></div></article>
+        <article class="status-guide-item status-yellow"><i aria-hidden="true">!</i><div><strong>已重路由，目标未知</strong><p>捕获到明确的 <code>model/rerouted</code>，但事件没有可显示的目标模型。这里只确认发生过重路由；小狸不会根据请求值、速度或文本特征补猜目标。</p></div></article>
         <article class="status-guide-item route-guide"><i aria-hidden="true">◇</i><div><strong>未见服务器重路由</strong><p>只表示小狸没有捕获显式 reroute 事件；它不证明服务器物理模型没有发生变化。</p></div></article>
         <article class="status-guide-item route-guide"><i aria-hidden="true">⌁</i><div><strong>连接来源</strong><p>显示官方登录、官方 API、自定义、本地或未知端点，并区分配置证据、部分证据和证据不足。它只说明连接配置，不能证明服务器物理模型。</p></div></article>
         <article class="status-guide-item route-guide"><i aria-hidden="true">◷</i><div><strong>下一回合待生效</strong><p>活动回合中修改模型或 effort 后，本回合继续保持原请求值，新值要到下一回合开始才成为活动请求。</p></div></article>

@@ -470,7 +470,12 @@ test("release workflow gates published assets and builds Universal on macOS 15",
   assert(ciBinaryScan > ciBuild, "CI does not scan the resulting native executable");
   assert.match(workflow, /runs-on: macos-15/);
   assert.match(workflow, /MACOSX_DEPLOYMENT_TARGET: "12\.0"/);
-  assert.match(workflow, /lipo -verify_arch arm64 x86_64/);
+  assert.match(workflow, /lipo "\$\{binary\}" -verify_arch arm64 x86_64/);
+  assert.doesNotMatch(
+    workflow,
+    /lipo -verify_arch arm64 x86_64 "\$\{binary\}"/,
+    "lipo requires the input file before the -verify_arch command",
+  );
   assert.match(workflow, /syft-version: v1\.51\.0/);
   assert.equal(
     (workflow.match(/prepare-rust-path-remap\.mjs/g) ?? []).length,
@@ -479,6 +484,22 @@ test("release workflow gates published assets and builds Universal on macOS 15",
   );
   assert.match(workflow, /assert-no-private-build-paths\.mjs/);
   assert.match(workflow, /Extract, scan and package AppImage archives/);
+
+  const portableSmoke = readFileSync(
+    join(repositoryRoot, "scripts", "release", "Test-Portable.ps1"),
+    "utf8",
+  );
+  assert.match(portableSmoke, /\$hookFallbackAttempts = 4/);
+  assert.match(
+    portableSmoke,
+    /\$attempt -le \$hookFallbackAttempts/,
+    "offline hook fallback must use a bounded number of independent attempts",
+  );
+  assert.match(
+    portableSmoke,
+    /No hook capture attempt wrote to isolated XIAOLI_STATE_DIR/,
+    "portable smoke must still fail when every fallback attempt is lost",
+  );
 
   const linuxPackager = readFileSync(
     join(repositoryRoot, "scripts", "release", "package-linux.sh"),

@@ -247,7 +247,7 @@ jobs:
           app="src-tauri/target/universal-apple-darwin/release/bundle/macos/XiaoLi.app"
           test -d "${app}"
           binary="${app}/Contents/MacOS/xiaoli"
-          lipo -verify_arch arm64 x86_64 "${binary}"
+          lipo "${binary}" -verify_arch arm64 x86_64
           for arch in arm64 x86_64; do
             thin="${RUNNER_TEMP}/xiaoli-${arch}"
             lipo "${binary}" -thin "${arch}" -output "${thin}"
