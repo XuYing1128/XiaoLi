@@ -291,6 +291,7 @@ select {
 .status-yellow { color: var(--yellow) !important; }
 .status-red { color: var(--red) !important; }
 .status-gray { color: var(--gray) !important; }
+.status-route { color: var(--blue) !important; }
 
 .workspace {
   min-width: 0;
@@ -959,7 +960,7 @@ select {
 
 .budget-panel {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 7px;
 }
 
@@ -972,6 +973,25 @@ select {
 .budget-item span,
 .budget-item strong {
   display: block;
+}
+
+.audit-mode-guidance {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--blue) 6%, var(--surface));
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.audit-mode-guidance strong {
+  color: var(--ink);
+}
+
+.audit-mode-guidance span {
+  color: var(--muted);
 }
 
 .budget-item span {
@@ -1202,6 +1222,44 @@ select {
   grid-template-columns: repeat(4, minmax(0, 1fr));
   margin-top: 14px;
   gap: 10px;
+}
+
+.status-guide-section {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+}
+
+.status-guide-section > .section-heading h2 {
+  font-size: 16px;
+}
+
+.status-guide-grid-three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.origin-guide {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 10px;
+  gap: 7px;
+}
+
+.origin-guide strong {
+  margin-right: 2px;
+  font-size: 12px;
+}
+
+.origin-guide span {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 11.5px;
 }
 
 .status-guide-card {
@@ -1447,6 +1505,7 @@ select {
   .summary-grid,
   .axis-grid,
   .status-guide-grid,
+  .status-guide-grid-three,
   .method-grid,
   .form-grid.two-columns,
   .detail-grid,

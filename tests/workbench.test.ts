@@ -476,7 +476,48 @@ describe("XiaoLi workbench audit safeguards", () => {
       expect(copy).toContain("与已验签静态参考一致（低置信）");
       expect(copy).toContain("静态一致不能单独令总裁决为正常");
       expect(copy).toContain("可用的可信签名静态参考");
+      for (const state of ["learning", "consistent", "suspectedDegradation"]) {
+        expect(copy).toContain(state);
+      }
+      for (const verdict of ["consistent", "insufficientEvidence", "suspectedPadding", "suspectedDegradation", "significantlyDifferent", "confirmedContractMismatch", "failed", "cancelled"]) {
+        expect(copy).toContain(verdict);
+      }
+      expect(copy).toContain("已重路由，目标未知");
+      expect(copy).toContain("OpenAI 官方 ChatGPT 登录");
+      expect(copy).toContain("连接来源未知");
+      expect(copy).toContain("已验签静态参考下 JSD 越过其签名校准阈值（低置信）");
+      const rerouteCard = Array.from(document.querySelectorAll<HTMLElement>(".status-guide-card"))
+        .find((card) => card.querySelector("h3")?.textContent?.includes("服务器已重路由"));
+      expect(rerouteCard).toBeDefined();
+      expect(rerouteCard?.classList.contains("status-route")).toBe(true);
+      expect(rerouteCard?.classList.contains("status-green")).toBe(false);
     });
+  });
+
+  it("shows each audit mode capability, limitation, and audit-wide timeout hard cap", async () => {
+    await boot();
+    click('[data-page="relay"]');
+
+    expect(document.querySelector(".budget-timeout")?.textContent).toBe("30 分钟");
+    expect(document.querySelector(".audit-mode-capability")?.textContent).toContain("少量单 token 指纹采样");
+    expect(document.querySelector(".audit-mode-limitation")?.textContent).toContain("质量轴保持学习中");
+
+    const standard = document.querySelector<HTMLInputElement>('input[name="audit-mode"][value="standard"]')!;
+    document.querySelector<HTMLInputElement>('input[name="audit-mode"][value="quick"]')!.checked = false;
+    standard.checked = true;
+    standard.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(document.querySelector(".budget-timeout")?.textContent).toBe("1 小时");
+    expect(document.querySelector(".audit-mode-capability")?.textContent).toContain("JSD/MMD");
+    expect(document.querySelector(".audit-mode-limitation")?.textContent).toContain("静态参考只提供低置信 JSD 身份比较");
+    expect(document.querySelector(".audit-mode-limitation")?.textContent).toContain("不能证明物理模型");
+
+    const deep = document.querySelector<HTMLInputElement>('input[name="audit-mode"][value="deep"]')!;
+    standard.checked = false;
+    deep.checked = true;
+    deep.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(document.querySelector(".budget-timeout")?.textContent).toBe("2 小时");
+    expect(document.querySelector(".audit-mode-capability")?.textContent).toContain("语义改写漂移");
+    expect(document.querySelector(".audit-mode-limitation")?.textContent).toContain("选择性诚实");
   });
 
   it("keeps the paired-reference wording for a live official paired audit", async () => {
@@ -579,6 +620,9 @@ describe("XiaoLi workbench audit safeguards", () => {
 
     expect(confirm).toHaveBeenCalledTimes(1);
     expect(confirm.mock.calls[0]?.[0]).toContain("完整计划：140 次 / 端点");
+    expect(confirm.mock.calls[0]?.[0]).toContain("整次超时硬上限：30 分钟（不是单请求超时）");
+    expect(confirm.mock.calls[0]?.[0]).toContain("本档能力：连接、协议、usage 算术");
+    expect(confirm.mock.calls[0]?.[0]).toContain("本档局限：每个质量域样本不足以形成一致或降质裁决");
     expect(tauri.invoke).not.toHaveBeenCalledWith("start_relay_audit", expect.anything());
   });
 
