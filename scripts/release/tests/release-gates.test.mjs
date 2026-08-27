@@ -476,6 +476,16 @@ test("release workflow gates published assets and builds Universal on macOS 15",
     /lipo -verify_arch arm64 x86_64 "\$\{binary\}"/,
     "lipo requires the input file before the -verify_arch command",
   );
+  assert.match(
+    workflow,
+    /load_commands="\$\(otool -l "\$\{thin\}"\)"/,
+    "the macOS load-command check must consume otool output before matching it",
+  );
+  assert.doesNotMatch(
+    workflow,
+    /otool -l "\$\{thin\}" \| grep -q "LC_BUILD_VERSION"/,
+    "grep -q can SIGPIPE otool under bash pipefail and turn a successful match into a failed step",
+  );
   assert.match(workflow, /syft-version: v1\.51\.0/);
   assert.equal(
     (workflow.match(/prepare-rust-path-remap\.mjs/g) ?? []).length,
