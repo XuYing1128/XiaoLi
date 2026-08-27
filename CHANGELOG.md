@@ -52,6 +52,7 @@
 - 继续只发布 Windows x64 便携 ZIP、macOS Universal `.app.zip`、Linux x64 AppImage ZIP/tar.gz 和插件 ZIP，不发布 NSIS/MSI/DMG/DEB/RPM 安装器。
 - 发布集合必须同时包含 `SHA256SUMS.txt`、SPDX JSON SBOM 和完整第三方许可目录；任一平台失败时不发布残缺 prerelease。
 - 三平台 Rust 构建统一重映射工作区、用户目录、Cargo 与 Rustup 路径；打包器会扫描可执行文件或 app bundle，并拒绝含未重映射构建机私有路径的产物。
+- macOS Universal 构建显式固定最低系统版本为 12.0，并同时复核两个 Mach-O 切片与最终 ZIP 内 `Info.plist` 的部署目标，避免架构间最低版本漂移。
 
 ## [0.1.0-beta.3] - 2026-08-25
 
